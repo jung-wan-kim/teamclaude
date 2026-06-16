@@ -245,11 +245,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
     // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
+    // (this is a transient rate limit, not quota exhaustion).
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
+
+      // Bound the retries: a persistently-throttled upstream must not loop
+      // forever (that would tie up the client connection indefinitely).
+      // Once retries are exhausted, throttle this account and re-dispatch —
+      // getActiveAccount then picks another account, or returns 429 to the
+      // client if every account is throttled.
+      if (retryCount >= maxRetries) {
+        console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
+        accountManager.markRateLimited(account.index, retryAfter);
+        if (logDir) {
+          logSections.push(`=== RESPONSE 429 — capped after ${retryCount} retries, throttling account ===\n${formatHeaders(upstreamRes.headers)}`);
+        }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
 
       if (logDir) {
         logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -258,7 +272,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       // Client may have disconnected during the wait
       if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
 
     // Log response headers
