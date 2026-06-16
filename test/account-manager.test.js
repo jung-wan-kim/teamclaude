@@ -119,6 +119,30 @@ test('warm-up: routes to each unmeasured account until all measured, then priori
   assert.equal(am.getActiveAccount().name, 'acct-1');
 });
 
+test('warm-up round-robins so a burst of any size stays spread (no pile-up on acct-0)', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 5 * MIN);
+  // 3 fresh accounts, no updateQuota between calls (simulates a concurrent startup
+  // burst). Even a burst far larger than maxWarmupTries * accountCount must keep
+  // spreading rather than pinning to acct-0 once warm-up attempts are exhausted.
+  const picks = Array.from({ length: 12 }, () => am.getActiveAccount().name);
+  assert.deepEqual(picks, [
+    'acct-0', 'acct-1', 'acct-2', 'acct-0', 'acct-1', 'acct-2',
+    'acct-0', 'acct-1', 'acct-2', 'acct-0', 'acct-1', 'acct-2',
+  ]);
+});
+
+test('warm-up gives up on an account after maxWarmupTries and lets priority start', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 5 * MIN);
+  const now = Date.now();
+  measure(am, 0, 0.30, 4 * HOUR, now);   // acct-0 measured; acct-1 keeps failing before headers
+  // acct-1 is a warm-up target; route to it maxWarmupTries times (no measurement)
+  for (let i = 0; i < am.maxWarmupTries; i++) {
+    assert.equal(am.getActiveAccount().name, 'acct-1');
+  }
+  // attempts exhausted → warm-up stops → priority over measured accounts (only acct-0)
+  assert.equal(am.getActiveAccount().name, 'acct-0');
+});
+
 test('warm-up skips unavailable accounts and does not re-warm a used account', () => {
   const am = new AccountManager(makeAccounts(2), 0.98);
   am.accounts[0].status = 'error';               // unavailable → never warmed

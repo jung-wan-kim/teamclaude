@@ -41,6 +41,8 @@ export class AccountManager {
     this.switchThreshold = switchThreshold;
     this.reevalIntervalMs = reevalIntervalMs;
     this.lastEvalAt = 0; // 0 forces a priority pick on the first request
+    this.maxWarmupTries = 3; // give up warming an account after this many unmeasured attempts
+    this._warmupCursor = 0;  // round-robin pointer used during warm-up
   }
 
   /**
@@ -69,10 +71,12 @@ export class AccountManager {
     const current = this.accounts[this.currentIndex];
 
     // Cold-start warm-up: until every available account has been measured at
-    // least once, route the next request to an unmeasured account so its quota
-    // (usage % / reset) gets populated. Only once all are measured does the
+    // least once, round-robin across the unmeasured accounts so their quota
+    // (usage % / reset) gets populated. Round-robin (not "first unmeasured")
+    // means a concurrent startup burst of any size spreads evenly instead of
+    // hammering one unknown-quota account. Only once all are measured does the
     // use-or-lose priority below take over — with complete data.
-    const warmup = this._nextUnmeasured();
+    const warmup = this._nextWarmup();
     if (warmup) {
       if (warmup.index !== this.currentIndex) {
         console.log(`[TeamClaude] Warm-up: measuring account "${warmup.name}"`);
@@ -103,6 +107,18 @@ export class AccountManager {
       }
     }
 
+    // While the current account is still unmeasured, keep load-balancing via
+    // _selectBest (which rotates among equal-rank accounts) instead of sticking
+    // to an unknown-quota account — so a cold-start burst stays spread even
+    // after per-account warm-up attempts are exhausted.
+    if (!this._isMeasured(current)) {
+      const best = this._selectBest();
+      if (best) {
+        this.currentIndex = best.index;
+        return best;
+      }
+    }
+
     return current;
   }
 
@@ -121,7 +137,17 @@ export class AccountManager {
       if (ra !== rb) return ra - rb;                                     // soonest reset first
       return this._sessionUtilization(a) - this._sessionUtilization(b);  // then least used
     });
-    return eligible[0];
+
+    // Accounts tied for the best rank (notably all-unknown at cold start) are
+    // load-balanced round-robin instead of always pinning to the lowest index,
+    // so a startup burst can't pile onto one account before quotas are known.
+    const r0 = this._sessionResetTime(eligible[0]);
+    const u0 = this._sessionUtilization(eligible[0]);
+    const tied = eligible
+      .filter(a => this._sessionResetTime(a) === r0 && this._sessionUtilization(a) === u0)
+      .sort((a, b) => a.index - b.index);
+    if (tied.length <= 1) return eligible[0];
+    return tied.find(a => a.index > this.currentIndex) || tied[0];
   }
 
   /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */
@@ -153,15 +179,40 @@ export class AccountManager {
   }
 
   /**
-   * First available account never measured yet (no quota data and no request
-   * sent through it). The totalRequests guard keeps this loop-safe: once a
-   * request has gone through, the account is no longer treated as unmeasured
-   * even if that response carried no rate-limit headers.
+   * An account still needing warm-up: available, never measured, no request
+   * sent yet, and under the per-account attempt cap.
+   * - totalRequests guard keeps it loop-safe: once a request has gone through,
+   *   the account is no longer treated as unmeasured even if that response
+   *   carried no rate-limit headers.
+   * - maxWarmupTries bounds it further: if requests to an account keep failing
+   *   before headers arrive (so totalRequests never increments), we still stop
+   *   warming it after a few attempts and let priority take over.
    */
-  _nextUnmeasured() {
-    return this.accounts.find(a =>
-      this._isAvailable(a) && !this._isMeasured(a) && a.usage.totalRequests === 0
-    ) || null;
+  _isWarmupTarget(account) {
+    return this._isAvailable(account)
+      && !this._isMeasured(account)
+      && account.usage.totalRequests === 0
+      && (account._warmupTries || 0) < this.maxWarmupTries;
+  }
+
+  /**
+   * Next account to warm up, round-robin across the warm-up targets so a burst
+   * spreads evenly. Advances the cursor and bumps the chosen account's attempt
+   * counter synchronously, so concurrent calls pick different accounts even
+   * before any response arrives. Returns null when no target remains.
+   */
+  _nextWarmup() {
+    const n = this.accounts.length;
+    for (let i = 0; i < n; i++) {
+      const idx = (this._warmupCursor + i) % n;
+      const a = this.accounts[idx];
+      if (this._isWarmupTarget(a)) {
+        this._warmupCursor = idx + 1;
+        a._warmupTries = (a._warmupTries || 0) + 1;
+        return a;
+      }
+    }
+    return null;
   }
 
   _isAvailable(account) {
