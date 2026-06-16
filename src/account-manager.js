@@ -18,7 +18,7 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98) {
+  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -39,18 +39,94 @@ export class AccountManager {
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.reevalIntervalMs = reevalIntervalMs;
+    this.lastEvalAt = 0; // 0 forces a priority pick on the first request
   }
 
   /**
-   * Get the best available account, rotating if the current one is near quota.
-   * Returns null if all accounts are exhausted.
+   * Get the account to use for the next request.
+   *
+   * Policy:
+   *  - If the current account is unavailable (near quota / throttled / error),
+   *    switch immediately to the highest-priority account. This is the old
+   *    "switch at threshold" trigger — but it now picks by priority rather
+   *    than round-robin to the next index.
+   *  - Otherwise re-evaluate priority at most once per `reevalIntervalMs`
+   *    (default 5 min) and switch if a higher-priority account exists.
+   *  - Between re-evaluations the current account is sticky, so a request
+   *    stream stays on one account and keeps Anthropic's per-account prompt
+   *    cache warm.
+   *
+   * Priority is "use-or-lose": soonest session reset first, then lowest
+   * session usage — so quota about to reset (and otherwise be wasted) is
+   * consumed first. Returns null if every account is exhausted.
    */
   getActiveAccount() {
+    const now = Date.now();
     const current = this.accounts[this.currentIndex];
-    if (this._isAvailable(current)) {
-      return current;
+
+    if (!this._isAvailable(current)) {
+      const best = this._selectBest();
+      if (best) {
+        if (best.index !== this.currentIndex) {
+          console.log(`[TeamClaude] Switched to account "${best.name}" (current unavailable)`);
+        }
+        this.currentIndex = best.index;
+        this.lastEvalAt = now;
+      }
+      return best;
     }
-    return this._selectNext();
+
+    if (now - this.lastEvalAt >= this.reevalIntervalMs) {
+      this.lastEvalAt = now;
+      const best = this._selectBest();
+      if (best && best.index !== this.currentIndex) {
+        console.log(`[TeamClaude] Re-prioritized to account "${best.name}" (session resets soonest)`);
+        this.currentIndex = best.index;
+        return best;
+      }
+    }
+
+    return current;
+  }
+
+  /**
+   * Highest-priority available account by use-or-lose ordering: soonest
+   * session reset first, then lowest session utilization. Falls back to the
+   * soonest-resetting account when none are currently available.
+   */
+  _selectBest() {
+    const eligible = this.accounts.filter(a => this._isAvailable(a));
+    if (eligible.length === 0) return this._recoverSoonest();
+
+    eligible.sort((a, b) => {
+      const ra = this._sessionResetTime(a);
+      const rb = this._sessionResetTime(b);
+      if (ra !== rb) return ra - rb;                                     // soonest reset first
+      return this._sessionUtilization(a) - this._sessionUtilization(b);  // then least used
+    });
+    return eligible[0];
+  }
+
+  /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */
+  _sessionResetTime(account) {
+    const q = account.quota;
+    if (q.unified5hReset) return q.unified5hReset;
+    if (q.resetsAt) return new Date(q.resetsAt).getTime();
+    return Infinity;
+  }
+
+  /** Session utilization 0–1: unified 5h (Max) → standard token/request usage → 0. */
+  _sessionUtilization(account) {
+    const q = account.quota;
+    if (q.unified5h != null) return q.unified5h;
+    if (q.tokensLimit != null && q.tokensRemaining != null) {
+      return 1 - q.tokensRemaining / q.tokensLimit;
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null) {
+      return 1 - q.requestsRemaining / q.requestsLimit;
+    }
+    return 0;
   }
 
   _isAvailable(account) {
@@ -114,21 +190,8 @@ export class AccountManager {
     return false;
   }
 
-  _selectNext() {
-    const startIndex = this.currentIndex;
-
-    for (let i = 1; i <= this.accounts.length; i++) {
-      const idx = (startIndex + i) % this.accounts.length;
-      const account = this.accounts[idx];
-
-      if (this._isAvailable(account)) {
-        this.currentIndex = idx;
-        console.log(`[TeamClaude] Switched to account "${account.name}"`);
-        return account;
-      }
-    }
-
-    // All accounts unavailable — find the one that resets soonest
+  /** When all accounts are unavailable, return the soonest to reset (if it has already reset). */
+  _recoverSoonest() {
     let soonestAccount = null;
     let soonestTime = Infinity;
 

@@ -87,9 +87,9 @@ function bar(ratio, w = 10, resetTs) {
   // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
   const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
 
-  // Build the label to overlay: show reset time if available, else percentage
+  // Always show usage %, and append the reset countdown when it fits.
   const pct = (ratio * 100).toFixed(0) + '%';
-  const label = rst || pct;
+  const label = (rst && pct.length + 1 + rst.length <= w) ? `${pct} ${rst}` : pct;
   const text = label.slice(0, w);
   const pad = w - text.length;
   const lp = Math.floor(pad / 2);
@@ -109,6 +109,18 @@ function bar(ratio, w = 10, resetTs) {
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
+}
+
+/** Humanize a token count: 850 → "850", 10_000 → "10k", 1_500 → "1.5k", 1_200_000 → "1.2M". */
+export function fmtTokens(n) {
+  if (!n) return '0';
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) {
+    const k = n / 1000;
+    return (k < 10 ? k.toFixed(1) : String(Math.round(k))) + 'k';
+  }
+  const m = n / 1_000_000;
+  return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + 'M';
 }
 
 // ── TUI class ────────────────────────────────────────────────
@@ -190,7 +202,10 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+    const tok = (info.inputTokens || info.outputTokens)
+      ? `  ${dim(`i ${fmtTokens(info.inputTokens || 0)} / o ${fmtTokens(info.outputTokens || 0)}`)}`
+      : '';
+    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tok}`);
   }
 
   _addLog(msg) {

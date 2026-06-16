@@ -8,7 +8,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ## Features
 
-- **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
+- **Use-or-lose account priority** — prioritizes the account whose session (5h) quota resets soonest (then lowest usage), re-evaluating every 5 minutes; switches immediately when the active account reaches the quota threshold (default 98%)
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
@@ -179,7 +179,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
 | `upstream` | Upstream API base URL |
-| `switchThreshold` | Quota utilization (0–1) at which to switch accounts |
+| `switchThreshold` | Quota utilization (0–1) at which an account is considered full and skipped |
+| `reevalIntervalMs` | How often (ms) to re-rank accounts by priority while the active one is healthy (optional, default `300000` = 5 min) |
 
 ## How It Works
 
@@ -187,7 +188,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-5. When usage reaches the threshold, the proxy switches to the next available account via round-robin
+5. Account selection is **use-or-lose**: among accounts still under the threshold, it prefers the one whose session quota resets soonest (tie-break: lowest usage), so quota about to reset isn't wasted. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
 8. If all accounts are exhausted, returns 429 with the soonest reset time

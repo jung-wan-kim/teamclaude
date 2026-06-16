@@ -11,7 +11,9 @@
     "src/"
   ],
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test",
+    "lint": "eslint ."
   },
   "keywords": [
     "claude",

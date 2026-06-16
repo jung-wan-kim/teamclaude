@@ -87,7 +87,8 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  const reevalIntervalMs = config.reevalIntervalMs ?? 5 * 60 * 1000;
+  const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
