@@ -8,9 +8,9 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ## Features
 
-- **Use-or-lose account priority** — prioritizes the account whose session (5h) quota resets soonest (then lowest usage), re-evaluating every 5 minutes; switches immediately when the active account reaches the quota threshold (default 98%)
-- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
-- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
+- **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose session (5h) quota resets soonest (then lowest usage), re-evaluating every 5 minutes; switches immediately when the active account reaches the quota threshold (default 98%)
+- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; after a bounded number of retries it throttles that account and switches to the next
+- **Interactive TUI** — real-time dashboard with color-coded quota bars showing usage %, reset countdowns, an activity log with per-request token sizes (e.g. `i 10k / o 20k`), and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
@@ -91,11 +91,13 @@ teamclaude server
 ```
 
 When running from a TTY, shows an interactive TUI with:
-- Account table with session/weekly quota progress bars and reset countdowns
-- Real-time activity log with request tracking
+- Account table with session/weekly quota progress bars (usage % overlaid, plus a reset countdown when space allows)
+- Real-time activity log with request tracking and per-request token sizes (`i <input> / o <output>`)
 - Keyboard shortcuts (see below)
 
 Falls back to plain log output when not a TTY (e.g. running as a service).
+
+If the configured port is already in use — for example another TeamClaude proxy is already running — the server prints a clear message and exits instead of crashing with an unhandled error. Inspect the existing one with `teamclaude status`, or find the listener with `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
 
 #### TUI Keyboard Shortcuts
 
@@ -189,7 +191,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
 5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose session quota resets soonest (tie-break: lowest usage), so quota about to reset isn't wasted. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min), and on reaching the threshold it switches immediately to the next-highest-priority account
-6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts
+6. On 429 responses, the proxy waits the `retry-after` duration and retries the same account; after a bounded number of retries it marks that account rate-limited and switches to the next (or returns 429 if all are throttled)
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
 8. If all accounts are exhausted, returns 429 with the soonest reset time
 9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
