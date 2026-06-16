@@ -59,7 +59,9 @@ Two header families drive rotation, normalized into one model:
 
 ### Account selection (`getActiveAccount` in account-manager.js)
 
-Selection is **use-or-lose**, not round-robin: among accounts under the threshold, `_selectBest` picks the one whose **session resets soonest** (`_sessionResetTime`), tie-broken by **lowest session utilization** (`_sessionUtilization`) — so quota that would otherwise reset unused is spent first. Both helpers fall back from unified (Max) to standard (API-key) metrics.
+**Cold-start warm-up first**: quota is only populated after a request flows through an account (`updateQuota`), so `_nextUnmeasured` returns the first available account with no quota data and `usage.totalRequests === 0`, and `getActiveAccount` routes to it before doing anything else. This drains the "unmeasured" set one request at a time; the `totalRequests` guard keeps it loop-safe. Only when no unmeasured account remains does priority selection run.
+
+Selection is then **use-or-lose**, not round-robin: among accounts under the threshold, `_selectBest` picks the one whose **session resets soonest** (`_sessionResetTime`), tie-broken by **lowest session utilization** (`_sessionUtilization`) — so quota that would otherwise reset unused is spent first. Both helpers fall back from unified (Max) to standard (API-key) metrics.
 
 To balance this against Anthropic's per-account prompt cache (separate per org → switching mid-stream causes cache-miss cost), the active account is **sticky**: priority is only re-evaluated once per `reevalIntervalMs` (default 5 min, `config.reevalIntervalMs`), plus immediately whenever the current account becomes unavailable (over threshold / throttled / error). `lastEvalAt = 0` forces a priority pick on the first request. When all accounts are over threshold, `_recoverSoonest` returns the soonest-to-reset (and `getActiveAccount` returns `null` until then, yielding a `429`).
 

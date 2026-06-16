@@ -244,7 +244,7 @@ export class TUI {
     else if (k === 's' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex;
     }
-    else if (k === 'r' && this.am.accounts.length > 0) {
+    else if (k === 'd' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
     }
     else if (k === 'a') { this.mode = 'add'; }
@@ -381,7 +381,7 @@ export class TUI {
     this.config.accounts.splice(idx, 1);
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
-    this._addLog(`Removed account "${name}"`);
+    this._addLog(`Deleted account "${name}"`);
   }
 
   // ── rendering ──────────────────────────────────────
@@ -519,9 +519,9 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('d')}elete  ${bold('R')}eload  ${bold('q')}uit`;
       case 'select': {
-        const act = this.selAction === 'switch' ? 'switch' : 'remove';
+        const act = this.selAction === 'switch' ? 'switch' : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':

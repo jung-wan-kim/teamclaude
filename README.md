@@ -103,7 +103,7 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 |-----|--------|
 | `s` | Switch active account |
 | `a` | Add account (import or API key) |
-| `r` | Remove an account |
+| `d` | Delete an account |
 | `R` | Reload accounts from config |
 | `q` | Quit |
 
@@ -188,7 +188,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-5. Account selection is **use-or-lose**: among accounts still under the threshold, it prefers the one whose session quota resets soonest (tie-break: lowest usage), so quota about to reset isn't wasted. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min), and on reaching the threshold it switches immediately to the next-highest-priority account
+5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose session quota resets soonest (tie-break: lowest usage), so quota about to reset isn't wasted. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On 429 responses, the proxy waits the `retry-after` duration and retries; on persistent errors, it switches accounts
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
 8. If all accounts are exhausted, returns 429 with the soonest reset time

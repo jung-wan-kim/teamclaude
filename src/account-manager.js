@@ -47,6 +47,9 @@ export class AccountManager {
    * Get the account to use for the next request.
    *
    * Policy:
+   *  - Cold-start warm-up: while any available account is still unmeasured,
+   *    route to it so its quota (usage % / reset) gets populated before any
+   *    priority decision is made on incomplete data.
    *  - If the current account is unavailable (near quota / throttled / error),
    *    switch immediately to the highest-priority account. This is the old
    *    "switch at threshold" trigger — but it now picks by priority rather
@@ -64,6 +67,19 @@ export class AccountManager {
   getActiveAccount() {
     const now = Date.now();
     const current = this.accounts[this.currentIndex];
+
+    // Cold-start warm-up: until every available account has been measured at
+    // least once, route the next request to an unmeasured account so its quota
+    // (usage % / reset) gets populated. Only once all are measured does the
+    // use-or-lose priority below take over — with complete data.
+    const warmup = this._nextUnmeasured();
+    if (warmup) {
+      if (warmup.index !== this.currentIndex) {
+        console.log(`[TeamClaude] Warm-up: measuring account "${warmup.name}"`);
+        this.currentIndex = warmup.index;
+      }
+      return warmup;
+    }
 
     if (!this._isAvailable(current)) {
       const best = this._selectBest();
@@ -127,6 +143,25 @@ export class AccountManager {
       return 1 - q.requestsRemaining / q.requestsLimit;
     }
     return 0;
+  }
+
+  /** True once we have any quota data for this account (rate-limit headers seen). */
+  _isMeasured(account) {
+    const q = account.quota;
+    return q.unified5h != null || q.unified7d != null
+      || q.tokensLimit != null || q.requestsLimit != null;
+  }
+
+  /**
+   * First available account never measured yet (no quota data and no request
+   * sent through it). The totalRequests guard keeps this loop-safe: once a
+   * request has gone through, the account is no longer treated as unmeasured
+   * even if that response carried no rate-limit headers.
+   */
+  _nextUnmeasured() {
+    return this.accounts.find(a =>
+      this._isAvailable(a) && !this._isMeasured(a) && a.usage.totalRequests === 0
+    ) || null;
   }
 
   _isAvailable(account) {
