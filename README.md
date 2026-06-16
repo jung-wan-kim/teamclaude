@@ -22,8 +22,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 18+.
 
 ```bash
-# Install
-npm install -g @karpeleslab/teamclaude
+# Install (from this repo)
+npm install -g github:jung-wan-kim/teamclaude
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
