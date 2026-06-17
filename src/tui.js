@@ -111,18 +111,6 @@ function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
-/** Humanize a token count: 850 → "850", 10_000 → "10k", 1_500 → "1.5k", 1_200_000 → "1.2M". */
-export function fmtTokens(n) {
-  if (!n) return '0';
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) {
-    const k = n / 1000;
-    return (k < 10 ? k.toFixed(1) : String(Math.round(k))) + 'k';
-  }
-  const m = n / 1_000_000;
-  return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + 'M';
-}
-
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
@@ -202,10 +190,7 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    const tok = (info.inputTokens || info.outputTokens)
-      ? `  ${dim(`i ${fmtTokens(info.inputTokens || 0)} / o ${fmtTokens(info.outputTokens || 0)}`)}`
-      : '';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tok}`);
+    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {

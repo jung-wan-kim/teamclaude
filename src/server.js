@@ -59,7 +59,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null, inputTokens: 0, outputTokens: 0 };
+      const ctx = { account: null, status: null };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       } catch (err) {
@@ -76,7 +76,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
-          inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens,
         });
       }
     } catch (err) {
@@ -306,14 +305,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog, ctx);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx);
+      extractUsageFromBody(buf, account.index, accountManager);
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
@@ -362,7 +361,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog, ctx) {
+async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -389,7 +388,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager, ctx);
+        parseSSEUsage(event, accountIndex, accountManager);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -405,7 +404,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager, ctx);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager);
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
@@ -414,14 +413,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
   }
 }
 
-// Total input the model actually processed (fresh + cache read + cache creation).
-function totalInput(usage) {
-  return (usage.input_tokens || 0)
-    + (usage.cache_read_input_tokens || 0)
-    + (usage.cache_creation_input_tokens || 0);
-}
-
-function parseSSEUsage(event, accountIndex, accountManager, ctx) {
+function parseSSEUsage(event, accountIndex, accountManager) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -429,26 +421,19 @@ function parseSSEUsage(event, accountIndex, accountManager, ctx) {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-      if (ctx) ctx.inputTokens += totalInput(data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
-      // message_delta carries the cumulative output total — keep the largest.
-      if (ctx) ctx.outputTokens = Math.max(ctx.outputTokens, data.usage.output_tokens || 0);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager, ctx) {
+function extractUsageFromBody(buffer, accountIndex, accountManager) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
-      if (ctx) {
-        ctx.inputTokens += totalInput(json.usage);
-        ctx.outputTokens = Math.max(ctx.outputTokens, json.usage.output_tokens || 0);
-      }
     }
   } catch {
     // not JSON or no usage

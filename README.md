@@ -10,7 +10,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose session (5h) quota resets soonest (then lowest usage), re-evaluating every 5 minutes; switches immediately when the active account reaches the quota threshold (default 98%)
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; after a bounded number of retries it throttles that account and switches to the next
-- **Interactive TUI** — real-time dashboard with color-coded quota bars showing usage %, reset countdowns, an activity log with per-request token sizes (e.g. `i 10k / o 20k`), and keyboard controls
+- **Interactive TUI** — real-time dashboard with color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
@@ -92,7 +92,7 @@ teamclaude server
 
 When running from a TTY, shows an interactive TUI with:
 - Account table with session/weekly quota progress bars (usage % overlaid, plus a reset countdown when space allows)
-- Real-time activity log with request tracking and per-request token sizes (`i <input> / o <output>`)
+- Real-time activity log with request tracking
 - Keyboard shortcuts (see below)
 
 Falls back to plain log output when not a TTY (e.g. running as a service).
