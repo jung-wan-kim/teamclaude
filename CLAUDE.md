@@ -45,7 +45,11 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 3. **`POST /v1/oauth/token` is relayed untouched** (`relayRaw`) — the client manages its own token lifecycle independently of the proxy's. Never intercept or rewrite it; doing so causes token-rotation conflicts.
 4. Body is fully buffered (needed to replay on 429 retry). Hop-by-hop headers, `x-api-key`, and `accept-encoding` are stripped before forwarding (Node `fetch` auto-decompresses, so `content-encoding`/`content-length` are also dropped on the way back).
 5. Account selected via `getActiveAccount()`; OAuth token refreshed if expiring within 5 min.
-6. **429 → wait `retry-after`, retry the *same* account** (transient rate limit, not exhaustion). When the active account crosses `switchThreshold`, the *next* request switches to the highest-priority account (see Account selection below).
+6. **429 handling classifies the 429 (`isExhausted`, checked after `updateQuota` folds in the response headers) before acting** — never sleep on `retry-after` holding the client connection:
+   - **Account-quota exhaustion** (`anthropic-ratelimit-unified-status: rejected`, or measured utilization ≥ threshold): throttle the account for `retry-after` (clamped to `[1s, 5m]`) and immediately re-dispatch to another available account. When *every* account is throttled, `getActiveAccount` returns `null` and the client gets a `429` to back off itself. This keeps cold-start warm-up fast (an exhausted account is skipped in one round-trip, not a 60s stall).
+   - **Non-exhaustion 429** (transient / global / IP / request-level — a 429 that would hit *any* account): pass it straight through to the client with the upstream `retry-after`, leaving the account **active**. Do NOT throttle or replay across the fleet — replaying a request-global 429 would poison every account and break unrelated requests. The client (Claude Code) handles its own backoff.
+
+   When the active account crosses `switchThreshold`, the *next* request switches to the highest-priority account (see Account selection below).
 7. **Transient network errors** (`ECONNRESET`/`ETIMEDOUT`/`fetch failed`) → `res.destroy()` so the client retries; they are not retried internally.
 8. All accounts unavailable → `429` with a `retry-after` computed from the soonest reset.
 

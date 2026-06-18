@@ -243,35 +243,71 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion).
+    // Handle 429s. A 429 can mean two very different things:
+    //   (a) this account is out of quota (account-level exhaustion), or
+    //   (b) a transient / global / IP / request-level limit that would 429 on
+    //       any account.
+    // Only (a) should throttle the account and switch; replaying (b) across the
+    // fleet would mark every account throttled and break unrelated requests.
+    // isExhausted() (checked after updateQuota folds in the 429 headers)
+    // distinguishes them.
     if (upstreamRes.status === 429) {
-      const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
+      let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
+      if (Number.isNaN(retryAfter)) retryAfter = 60;
+      retryAfter = Math.min(Math.max(retryAfter, 1), 300); // clamp [1s, 5m]
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
-      // Bound the retries: a persistently-throttled upstream must not loop
-      // forever (that would tie up the client connection indefinitely).
-      // Once retries are exhausted, throttle this account and re-dispatch —
-      // getActiveAccount then picks another account, or returns 429 to the
-      // client if every account is throttled.
-      if (retryCount >= maxRetries) {
-        console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
+      if (accountManager.isExhausted(account.index)) {
+        // (a) Account-level exhaustion: throttle this account (so
+        // getActiveAccount skips it until it resets) and immediately
+        // re-dispatch to another available account — never sleep holding the
+        // client. When every account is throttled, getActiveAccount returns
+        // null and the client gets a 429 to back off on its own.
+        console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
         accountManager.markRateLimited(account.index, retryAfter);
         if (logDir) {
-          logSections.push(`=== RESPONSE 429 — capped after ${retryCount} retries, throttling account ===\n${formatHeaders(upstreamRes.headers)}`);
+          logSections.push(`=== RESPONSE 429 — account quota exhausted, throttled ${retryAfter}s, switching ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        if (res.destroyed) return;
+
+        // Safety backstop: each retry throttles a distinct account, so
+        // getActiveAccount returns null before this can fire. Cap anyway.
+        if (retryCount >= maxRetries) {
+          ctx.status = 429;
+          const ra = computeRetryAfter(accountManager.getStatus().accounts);
+          if (!res.headersSent) {
+            res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'rate_limit_error', message: `All accounts throttled. Retry in ${ra}s.` },
+            }));
+          }
+          return;
         }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
+      // (b) Non-exhaustion 429: this is not this account being out of quota, so
+      // do NOT throttle it or fan the request across the fleet. Pass the 429
+      // through to the client with the upstream retry-after; the client (e.g.
+      // Claude Code) backs off and retries on its own. No account is poisoned.
+      console.log(`[TeamClaude] 429 (transient/global) on "${account.name}" — passing through, account left active`);
+      ctx.status = 429;
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — transient/global, passed through (account left active) ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
       if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
+        }));
+      }
+      return;
     }
 
     // Log response headers

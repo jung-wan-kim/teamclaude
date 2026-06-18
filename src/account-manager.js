@@ -366,6 +366,28 @@ export class AccountManager {
   }
 
   /**
+   * Does a 429 from this account indicate genuine *account-level quota
+   * exhaustion* (vs a transient / global / IP / request-level 429)?
+   *
+   * Only exhaustion 429s should throttle the account and trigger a switch to
+   * another account. A non-exhaustion 429 must NOT be replayed across the
+   * fleet — otherwise a single request whose 429 is request-global (e.g. a
+   * malformed request, an org/IP limit, or a momentary upstream blip) would
+   * poison every account and make unrelated requests fail too.
+   *
+   * Call this *after* updateQuota() has folded the 429's rate-limit headers
+   * into the account's quota state.
+   */
+  isExhausted(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return false;
+    // Claude Max: upstream explicitly rejects when over the unified limit.
+    if (account.quota.unifiedStatus === 'rejected') return true;
+    // Otherwise rely on measured utilization (unified or standard headers).
+    return this._isNearQuota(account);
+  }
+
+  /**
    * Mark an account as rate-limited for a given duration.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
