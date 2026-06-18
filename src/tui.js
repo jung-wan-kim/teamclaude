@@ -474,11 +474,14 @@ export class TUI {
     }
     status = rpad(status, 10);
 
-    // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
+    // Quota ratios — labelled by account TYPE, not by which data happens to be
+    // present. An OAuth (Claude Max) account always shows Ses/Wk (with "-" when
+    // not yet measured); an API-key account shows Tok/Req. Keying on the data
+    // (unified5h != null) mislabels an unmeasured OAuth account as Tok/Req.
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
 
-    if (q.unified5h != null || q.unified7d != null) {
+    if (a.type === 'oauth') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;

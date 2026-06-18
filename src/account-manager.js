@@ -179,19 +179,27 @@ export class AccountManager {
   }
 
   /**
-   * An account still needing warm-up: available, never measured, no request
-   * sent yet, and under the per-account attempt cap.
-   * - totalRequests guard keeps it loop-safe: once a request has gone through,
-   *   the account is no longer treated as unmeasured even if that response
-   *   carried no rate-limit headers.
-   * - maxWarmupTries bounds it further: if requests to an account keep failing
-   *   before headers arrive (so totalRequests never increments), we still stop
-   *   warming it after a few attempts and let priority take over.
+   * An account still needing warm-up: available, not yet MEASURED, under the
+   * per-account attempt cap.
+   *
+   * Keying on `!_isMeasured` (not on "has it made a request") is deliberate: a
+   * request can return *no* rate-limit headers — a `HEAD /` health check, a
+   * 404, an auth failure — which would leave the account unmeasured. Gating
+   * warm-up on `totalRequests === 0` used to permanently disqualify such an
+   * account after that single header-less request, trapping it as "unmeasured"
+   * forever: it then sorts to the bottom of use-or-lose priority (no reset
+   * data) and the unmeasured-rebalance bounces any switch away from it, so it
+   * never gets used again — and its token never gets refreshed, so it expires.
+   *
+   * maxWarmupTries provides the loop-safety instead: a genuinely dead account
+   * (always header-less / 401) is abandoned after a few attempts rather than
+   * looping forever. (An expired-token account is resolved on its first warm-up
+   * routing anyway — ensureTokenFresh either refreshes it into a measurable
+   * state or marks it `error`, which makes it unavailable here.)
    */
   _isWarmupTarget(account) {
     return this._isAvailable(account)
       && !this._isMeasured(account)
-      && account.usage.totalRequests === 0
       && (account._warmupTries || 0) < this.maxWarmupTries;
   }
 

@@ -59,7 +59,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null };
+      const ctx = { account: null, status: null, authRetried: new Set() };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       } catch (err) {
@@ -153,8 +153,24 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Select account
   const account = accountManager.getActiveAccount();
   if (!account) {
-    ctx.status = 429;
     ctx.account = '(none available)';
+    // If every account is in auth-error state, this is an authentication
+    // problem (revoked/expired tokens needing re-login), not a rate limit —
+    // return 401 so the client surfaces it instead of pointlessly backing off.
+    const accts = accountManager.accounts;
+    if (accts.length > 0 && accts.every(a => a.status === 'error')) {
+      ctx.status = 401;
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: `All ${accts.length} accounts failed authentication. Re-login required.`,
+        },
+      }));
+      return;
+    }
+    ctx.status = 429;
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts);
     res.writeHead(429, {
@@ -165,7 +181,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
       },
     }));
     return;
@@ -242,6 +258,59 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
+
+    // 401 = auth failure (stale or revoked token). For OAuth, attempt one
+    // forced token refresh and retry the same account (the token may be stale
+    // but still refreshable). If that doesn't fix it — refresh fails, the token
+    // is revoked, or it's an API-key account — mark the account 'error' so it's
+    // excluded from BOTH selection and warm-up, then switch to another account.
+    // Without this, warm-up would keep routing client traffic to a revoked
+    // account (it stays unmeasured/active), yielding repeated 401s.
+    if (upstreamRes.status === 401) {
+      await upstreamRes.body?.cancel();
+
+      if (account.type === 'oauth' && account.refreshToken
+          && !ctx.authRetried.has(account.index)
+          && retryCount < maxRetries && !res.destroyed) {
+        ctx.authRetried.add(account.index);
+        console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
+        await accountManager.ensureTokenFresh(account.index, true);
+        // ensureTokenFresh only marks 'error' for an expired token; a successful
+        // (or non-fatal) refresh leaves status intact → retry the same account.
+        if (account.status !== 'error') {
+          if (logDir) {
+            logSections.push(`=== RESPONSE 401 — forced token refresh, retrying ===`);
+            writeRequestLog(logDir, reqId, logSections);
+          }
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+      }
+
+      // Refresh didn't help (failed / already retried / revoked-but-unexpired)
+      // or it's an API-key account — fail this account out and switch.
+      if (account.status !== 'error') {
+        account.status = 'error';
+        console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
+      }
+      if (logDir) {
+        logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (res.destroyed) return;
+      if (retryCount < maxRetries) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+      // Every account failed auth — surface the 401 to the client.
+      ctx.status = 401;
+      if (!res.headersSent) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: 'All accounts failed authentication.' },
+        }));
+      }
+      return;
+    }
 
     // Handle 429s. A 429 can mean two very different things:
     //   (a) this account is out of quota (account-level exhaustion), or

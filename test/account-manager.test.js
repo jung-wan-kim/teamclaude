@@ -143,12 +143,37 @@ test('warm-up gives up on an account after maxWarmupTries and lets priority star
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
-test('warm-up skips unavailable accounts and does not re-warm a used account', () => {
+test('warm-up skips unavailable accounts', () => {
   const am = new AccountManager(makeAccounts(2), 0.98);
   am.accounts[0].status = 'error';               // unavailable → never warmed
   assert.equal(am.getActiveAccount().name, 'acct-1');
-  // A request went through but returned no rate-limit headers (only totalRequests++)
-  am.accounts[1].usage.totalRequests = 1;
-  // Loop-safe: acct-1 no longer treated as unmeasured, so no warm-up loop
+});
+
+// Regression: a request that returns NO rate-limit headers (a HEAD / health
+// check, a 404, an auth failure) must NOT permanently disqualify the account
+// from warm-up. Otherwise it stays "unmeasured" forever — sorted to the bottom
+// of use-or-lose priority (no reset data) and bounced by the unmeasured-
+// rebalance — so rotation never uses it and its token never refreshes.
+// (Real-world: maestrobs74/77 stuck unmeasured with expired tokens.)
+test('a header-less response does not trap an account as permanently unmeasured', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 5 * MIN);
+  const now = Date.now();
+  measure(am, 0, 0.10, 4 * HOUR, now);                  // acct-0 healthy + measured
+
+  // acct-1 gets a warm-up request that returns no rate-limit headers:
+  // updateQuota with empty headers bumps totalRequests but leaves it unmeasured.
+  assert.equal(am.getActiveAccount().name, 'acct-1');   // warm-up routes to it
+  am.updateQuota(1, {});                                 // header-less response
+  assert.equal(am.accounts[1].usage.totalRequests, 1);
+  assert.equal(am._isMeasured(am.accounts[1]), false);
+
+  // It must STILL be a warm-up target (not abandoned), so a real measurement
+  // can still happen. On the OLD code this returned acct-0 (acct-1 trapped).
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+
+  // Once a header-bearing response measures it, warm-up stops and use-or-lose
+  // priority takes over (acct-1 resets soonest → chosen).
+  measure(am, 1, 0.10, 5 * MIN, now);
+  assert.equal(am._isMeasured(am.accounts[1]), true);
   assert.equal(am.getActiveAccount().name, 'acct-1');
 });
