@@ -68,6 +68,23 @@ test('re-prioritizes after the interval elapses', () => {
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
+test('reevalIntervalMs <= 0 disables periodic re-prioritization (stays sticky)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);   // 0 = timer disabled
+  const now = Date.now();
+  setSession(am, 0, 0.50, 4 * HOUR, now);   // current (index 0), far reset, higher usage
+  setSession(am, 1, 0.10, 5 * MIN, now);    // soonest reset + lower usage — would win if the timer ran
+
+  // Timer disabled → never re-prioritizes, so it stays on the initial current
+  // (acct-0) instead of switching to the use-or-lose winner acct-1...
+  assert.equal(am.getActiveAccount().name, 'acct-0');
+  am.lastEvalAt = now - 60 * MIN;                  // even with lots of time "elapsed"
+  assert.equal(am.getActiveAccount().name, 'acct-0');
+
+  // ...but a forced switch still happens when the current account is unavailable.
+  am.accounts[0].quota.unified5h = 0.99;           // current now over threshold
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+});
+
 test('immediate switch when current hits threshold, picking by priority', () => {
   const am = new AccountManager(makeAccounts(3), 0.98, 5 * MIN);
   setSession(am, 0, 0.10, 4 * HOUR);

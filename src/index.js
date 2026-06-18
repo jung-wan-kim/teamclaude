@@ -87,7 +87,13 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const reevalIntervalMs = config.reevalIntervalMs ?? 5 * 60 * 1000;
+  // An explicit numeric `reevalIntervalMs: 0` (or any number <= 0) disables the
+  // 5-minute periodic account re-switching. Require a finite number so a
+  // malformed value (false, "", "abc", null, ...) falls back to the default
+  // rather than silently disabling switching.
+  const reevalIntervalMs = Number.isFinite(config.reevalIntervalMs)
+    ? config.reevalIntervalMs
+    : 5 * 60 * 1000;
   const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering

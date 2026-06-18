@@ -57,7 +57,10 @@ export class AccountManager {
    *    "switch at threshold" trigger — but it now picks by priority rather
    *    than round-robin to the next index.
    *  - Otherwise re-evaluate priority at most once per `reevalIntervalMs`
-   *    (default 5 min) and switch if a higher-priority account exists.
+   *    (default 5 min) and switch if a higher-priority account exists. Set
+   *    `reevalIntervalMs <= 0` (config `reevalIntervalMs: 0`) to disable this
+   *    timer entirely — the account then only changes when it becomes
+   *    unavailable or via per-request 429 failover.
    *  - Between re-evaluations the current account is sticky, so a request
    *    stream stays on one account and keeps Anthropic's per-account prompt
    *    cache warm.
@@ -106,7 +109,11 @@ export class AccountManager {
       return best;
     }
 
-    if (now - this.lastEvalAt >= this.reevalIntervalMs) {
+    // Periodic re-prioritization. Disabled when reevalIntervalMs <= 0: the
+    // current account then stays sticky and only changes when it becomes
+    // unavailable (exhausted / throttled / error) or via per-request 429
+    // failover — no timer-driven switching.
+    if (this.reevalIntervalMs > 0 && now - this.lastEvalAt >= this.reevalIntervalMs) {
       this.lastEvalAt = now;
       const best = this._selectBest();
       if (best && best.index !== this.currentIndex) {
