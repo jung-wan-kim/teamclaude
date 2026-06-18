@@ -66,8 +66,17 @@ export class AccountManager {
    * session usage — so quota about to reset (and otherwise be wasted) is
    * consumed first. Returns null if every account is exhausted.
    */
-  getActiveAccount() {
+  getActiveAccount(exclude = null) {
     const now = Date.now();
+
+    // Per-request failover: a prior account already returned a non-quota 429
+    // for THIS request (its indexes are in `exclude`). Pick another available
+    // account by priority WITHOUT touching the sticky primary or warm-up state
+    // — this diverts only the overflow of one request; steady-state selection
+    // still prefers the use-or-lose primary, keeping its prompt cache warm.
+    // Returns null once every available account has been tried this request.
+    if (exclude && exclude.size) return this._selectBest(exclude);
+
     const current = this.accounts[this.currentIndex];
 
     // Cold-start warm-up: until every available account has been measured at
@@ -126,10 +135,15 @@ export class AccountManager {
    * Highest-priority available account by use-or-lose ordering: soonest
    * session reset first, then lowest session utilization. Falls back to the
    * soonest-resetting account when none are currently available.
+   *
+   * `exclude` (a Set of indexes) is used for per-request failover: those
+   * accounts are skipped, and when nothing else is eligible this returns null
+   * (instead of recovering one) so the caller can pass the 429 through.
    */
-  _selectBest() {
-    const eligible = this.accounts.filter(a => this._isAvailable(a));
-    if (eligible.length === 0) return this._recoverSoonest();
+  _selectBest(exclude = null) {
+    const has = i => (exclude ? exclude.has(i) : false);
+    const eligible = this.accounts.filter(a => this._isAvailable(a) && !has(a.index));
+    if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
 
     eligible.sort((a, b) => {
       const ra = this._sessionResetTime(a);

@@ -100,15 +100,57 @@ test('all accounts exhausted → bounded retries, returns 429', async () => {
   }
 });
 
-// Regression (adversarial review): a NON-exhaustion 429 (transient / global /
-// IP / request-level) must NOT be replayed across the fleet. A single such
-// request must hit upstream exactly once, leave every account active (not
-// throttled), and pass the 429 through to the client.
-test('non-exhaustion 429 passes through without poisoning the fleet', async () => {
+// A non-exhaustion 429 (request-rate / concurrency limit) on a busy account
+// must fail the request OVER to an idle account — not pass the 429 to the
+// client. This is the real-world case: all concurrent traffic pinned to one
+// account (use-or-lose primary) hits its RPM limit while it still has token
+// quota; the overflow should spill to a healthy account.
+test('non-exhaustion 429 fails over to a healthy account (no throttle)', async () => {
+  const upstream = http.createServer((req, res) => {
+    const auth = req.headers['authorization'] || '';
+    if (auth.includes('tok-a')) {
+      // Rate/concurrency 429: short retry-after, NO quota-exhaustion signals.
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200);                  // served by the idle account, not 429'd to client
+    assert.equal(am.accounts[0].status, 'active');  // rate-limited account NOT throttled (still usable)
+    assert.equal(am.accounts[1].status, 'active');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Regression (adversarial review): a request-GLOBAL 429 (would 429 on every
+// account) must not poison the fleet. The request fails over through each
+// account once, then passes the 429 through — but leaves EVERY account active
+// (no throttle), so unrelated requests are unaffected.
+test('request-global 429 tries each account once then passes through, no poisoning', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
-    // Blanket 429 with NO quota signals — a request-level/global limit.
+    // Blanket 429 with NO quota signals — 429s regardless of account.
     res.writeHead(429, { 'retry-after': '120', 'content-type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
   });
@@ -129,9 +171,9 @@ test('non-exhaustion 429 passes through without poisoning the fleet', async () =
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
     await res.text();
-    assert.equal(res.status, 429);                                  // passed through to client
-    assert.equal(upstreamHits, 1, `expected no fan-out, got ${upstreamHits} hits`);
-    assert.ok(am.accounts.every(a => a.status === 'active'),        // no account poisoned
+    assert.equal(res.status, 429);                                  // passed through after trying all
+    assert.equal(upstreamHits, 3, `expected one try per account, got ${upstreamHits}`);
+    assert.ok(am.accounts.every(a => a.status === 'active'),        // no account poisoned/throttled
       `expected all accounts active, got ${am.accounts.map(a => a.status).join(',')}`);
   } finally {
     proxy.close();

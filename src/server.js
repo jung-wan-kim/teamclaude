@@ -59,7 +59,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null, authRetried: new Set() };
+      const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set() };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       } catch (err) {
@@ -150,8 +150,10 @@ function formatHeaders(headers) {
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
-  // Select account
-  const account = accountManager.getActiveAccount();
+  // Select account. On a failover retry (a prior account 429'd for this
+  // request) ctx.tried429 is non-empty → pick a different account, skipping the
+  // ones already tried.
+  const account = accountManager.getActiveAccount(ctx.tried429.size ? ctx.tried429 : null);
   if (!account) {
     ctx.account = '(none available)';
     // If every account is in auth-error state, this is an authentication
@@ -358,14 +360,30 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      // (b) Non-exhaustion 429: this is not this account being out of quota, so
-      // do NOT throttle it or fan the request across the fleet. Pass the 429
-      // through to the client with the upstream retry-after; the client (e.g.
-      // Claude Code) backs off and retries on its own. No account is poisoned.
-      console.log(`[TeamClaude] 429 (transient/global) on "${account.name}" — passing through, account left active`);
+      // (b) Non-exhaustion 429: usually an account-level request-rate /
+      // concurrency limit (the account still has token quota, but is being hit
+      // too fast) — or a transient / global limit. Try ANOTHER account for THIS
+      // request (per-request exclusion via ctx.tried429) so concurrent overflow
+      // spreads to an idle account instead of failing. Crucially we do NOT
+      // throttle the account: throttling on a request-global 429 would poison
+      // the fleet for unrelated requests. Only when every available account has
+      // been tried for this request (→ effectively global) is the 429 passed
+      // through to the client; no account state is mutated either way.
+      ctx.tried429.add(account.index);
+      if (!res.destroyed && retryCount < maxRetries
+          && accountManager.getActiveAccount(ctx.tried429)) {
+        console.log(`[TeamClaude] 429 (rate/transient) on "${account.name}" — switching account for this request`);
+        if (logDir) {
+          logSections.push(`=== RESPONSE 429 — rate/transient, switching account (not throttled) ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      console.log(`[TeamClaude] 429 (global) on "${account.name}" — every account tried, passing through`);
       ctx.status = 429;
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — transient/global, passed through (account left active) ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — global, passed through after trying all accounts ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;
