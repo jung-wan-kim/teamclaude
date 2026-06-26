@@ -59,7 +59,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const body = Buffer.concat(bodyChunks);
 
-      const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set() };
+      const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0 };
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       } catch (err) {
@@ -147,13 +147,25 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
+// Upstream statuses that are transient and safe to retry instead of surfacing to
+// the client. 529 = "Overloaded" (Anthropic at capacity); 500/502/503/504 =
+// gateway / availability blips. Passing these straight through fails the client's
+// turn — e.g. Claude Code prints "API Error: 529 Overloaded" and stops — so
+// forwardRequest fails them over to another account and, when the whole fleet is
+// overloaded, retries with a bounded exponential backoff before giving up.
+const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
   // Select account. On a failover retry (a prior account 429'd for this
   // request) ctx.tried429 is non-empty → pick a different account, skipping the
   // ones already tried.
-  const account = accountManager.getActiveAccount(ctx.tried429.size ? ctx.tried429 : null);
+  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size)
+    ? new Set([...ctx.tried429, ...ctx.tried5xx])
+    : null;
+  const account = accountManager.getActiveAccount(excludeForSelect);
   if (!account) {
     ctx.account = '(none available)';
     // If every account is in auth-error state, this is an authentication
@@ -392,6 +404,72 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
+        }));
+      }
+      return;
+    }
+
+    // Handle retryable upstream 5xx (notably 529 "Overloaded" — Anthropic is over
+    // capacity). Unlike a 429, a 529 is NOT account-specific: every account hits
+    // the same overloaded upstream. Surfacing it fails the client's turn, so:
+    //   (1) fail this request over to another account (cheap; for 500/502/503/504 a
+    //       different account/region is occasionally healthier), then
+    //   (2) once every account has 5xx'd for this request, wait a bounded
+    //       exponential backoff and retry the whole fleet — the client transparently
+    //       gets the eventual success instead of an error.
+    // Only after the backoff budget is spent is the 5xx surfaced (so the client is
+    // never left hanging indefinitely). No account state is mutated — a 529 is
+    // upstream overload, not a bad account.
+    if (RETRYABLE_STATUS.has(upstreamRes.status)) {
+      const code = upstreamRes.status;
+      await upstreamRes.body?.cancel();
+
+      const maxOverload = Math.max(0, parseInt(process.env.TEAMCLAUDE_OVERLOAD_RETRIES, 10) || 6);
+      const backoffBase = Math.max(50, parseInt(process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS, 10) || 1000);
+      const backoffCap = Math.max(backoffBase, parseInt(process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS, 10) || 10000);
+
+      // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this request.
+      ctx.tried5xx.add(account.index);
+      const exclude5xx = new Set([...ctx.tried429, ...ctx.tried5xx]);
+      if (!res.destroyed && retryCount < maxRetries
+          && accountManager.getActiveAccount(exclude5xx)) {
+        console.log(`[TeamClaude] ${code} on "${account.name}" — switching account for this request`);
+        if (logDir) {
+          logSections.push(`=== RESPONSE ${code} — transient upstream 5xx, switching account ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      // (2) Every account 5xx'd for this request → upstream overload. Back off and
+      // retry the whole fleet so the client transparently rides out the blip.
+      if (!res.destroyed && ctx.overloadRetries < maxOverload) {
+        const waitMs = Math.min(backoffBase * 2 ** ctx.overloadRetries, backoffCap);
+        ctx.overloadRetries += 1;
+        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
+        if (logDir) {
+          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        await sleep(waitMs);
+        if (res.destroyed) return;
+        ctx.tried5xx.clear(); // fresh round: let every account be tried again
+        return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+      }
+
+      // (3) Backoff budget spent — surface the 5xx rather than hold the client forever.
+      console.log(`[TeamClaude] ${code} on "${account.name}" — overload persisted after ${ctx.overloadRetries} backoffs, passing through`);
+      ctx.status = code;
+      if (logDir) {
+        logSections.push(`=== RESPONSE ${code} — overload persisted after ${ctx.overloadRetries} backoffs, passed through ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (res.destroyed) return;
+      if (!res.headersSent) {
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: `Upstream overloaded (HTTP ${code}). Retried ${ctx.overloadRetries}x.` },
         }));
       }
       return;
