@@ -5,6 +5,8 @@
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "maxConcurrentPerAccount": 3,
+  "overflowQueueTimeoutMs": 15000,
   "accounts": [
     {
       "name": "primary-max",
@@ -15,7 +17,8 @@
       "name": "secondary-max",
       "type": "oauth",
       "accessToken": "sk-ant-oat01-your-access-token",
-      "refreshToken": "sk-ant-ort01-your-refresh-token"
+      "refreshToken": "sk-ant-ort01-your-refresh-token",
+      "maxConcurrent": 5
     },
     {
       "name": "api-fallback",

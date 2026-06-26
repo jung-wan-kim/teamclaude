@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
+import { unlinkSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -14,6 +15,13 @@ const command = args[0];
 switch (command) {
   case 'server':
     await serverCommand();
+    break;
+  case 'stop':
+    await stopCommand();
+    process.exit(0);
+    break;
+  case 'restart':
+    await restartCommand();
     break;
   case 'run':
     await runCommand();
@@ -94,7 +102,13 @@ async function serverCommand() {
   const reevalIntervalMs = Number.isFinite(config.reevalIntervalMs)
     ? config.reevalIntervalMs
     : 5 * 60 * 1000;
-  const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs);
+  // Default per-account concurrency cap (max simultaneous in-flight requests an
+  // account handles before load spreads to the next account). A per-account
+  // `maxConcurrent` overrides this. Must be a positive number, else default 3.
+  const maxConcurrentDefault = Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1
+    ? config.maxConcurrentPerAccount
+    : 3;
+  const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -168,6 +182,17 @@ async function serverCommand() {
     };
   }
 
+  // If a TeamClaude server is already running on this config's port, don't try to
+  // bind on top of it — point the user at stop/restart instead of a raw EADDRINUSE.
+  const existing = await findRunningServer(config);
+  if (existing && existing.port === port) {
+    console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
+    console.error('  See it:      teamclaude status');
+    console.error('  Stop it:     teamclaude stop');
+    console.error('  Restart it:  teamclaude restart');
+    process.exit(1);
+  }
+
   const server = createProxyServer(accountManager, config, hooks);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
@@ -177,6 +202,12 @@ async function serverCommand() {
 
   server.listen(port, () => {
     server.removeListener('error', onListenError);
+    // Record runtime state so `teamclaude status/stop/restart` can find us, and
+    // remove it on process exit (covers SIGINT/SIGTERM/TUI quit/normal exit). A
+    // SIGKILL leaves a stale file, which stop/server detect as dead and clean up.
+    writeServerState({ pid: process.pid, port, startedAt: new Date().toISOString(), config: getConfigPath() }).catch(() => {});
+    const stateP = getServerStatePath();
+    process.on('exit', () => { try { unlinkSync(stateP); } catch { /* already gone */ } });
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -212,6 +243,155 @@ async function serverCommand() {
       server.close(() => process.exit(0));
     });
   }
+}
+
+// ── server lifecycle: discover / stop / restart ─────────────
+
+// Function declaration (not a const arrow) so it is hoisted — these helpers run
+// from the top-level command switch, which executes before later `const` lines
+// in this module are initialized (temporal dead zone).
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Is a pid alive? EPERM = alive but not ours; ESRCH = gone. */
+function isPidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === 'EPERM'; }
+}
+
+async function waitForExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await delay(150);
+  }
+  return !isPidAlive(pid);
+}
+
+/**
+ * Does a *TeamClaude* proxy answer on this port? Verifies the status endpoint
+ * returns our JSON shape, not just any 200 — so a foreign process occupying the
+ * port is NOT mistaken for our server (it falls through to the EADDRINUSE path).
+ */
+async function probeServer(port, timeoutMs = 1500) {
+  if (!port) return false;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: ctrl.signal });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
+  } catch { return false; }
+  finally { clearTimeout(timer); }
+}
+
+/** Best-effort: the pid listening on a TCP port (macOS/Linux via lsof). */
+function lsofPid(port) {
+  if (process.platform === 'win32') return null;
+  try {
+    const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
+    const pid = parseInt((r.stdout || '').trim().split('\n')[0], 10);
+    return Number.isInteger(pid) ? pid : null;
+  } catch { return null; }
+}
+
+/**
+ * Locate a running TeamClaude server for this config. Trusts the recorded state
+ * file (pid + port) when the pid is alive AND the port answers; otherwise clears
+ * a stale file and falls back to probing the config's port (+ lsof for the pid),
+ * so even a server started before state tracking can still be found. Returns
+ * { pid, port } (pid may be null if only discoverable by port), or null.
+ */
+async function findRunningServer(config) {
+  const port = config?.proxy?.port;
+  const state = await readServerState();
+
+  if (state?.pid && isPidAlive(state.pid) && await probeServer(state.port)) {
+    return { pid: state.pid, port: state.port };
+  }
+  if (state) await clearServerState(); // stale: dead pid or unreachable
+
+  if (await probeServer(port)) {
+    return { pid: lsofPid(port), port };
+  }
+  return null;
+}
+
+/**
+ * Stop the running server: SIGTERM, wait for graceful exit, escalate to SIGKILL.
+ * Returns { stopped, reason?, pid?, port? }.
+ */
+async function stopRunningServer() {
+  const config = await loadConfig();
+  if (!config) return { stopped: false, reason: 'not-running' };
+
+  const found = await findRunningServer(config);
+  if (!found) { await clearServerState(); return { stopped: false, reason: 'not-running' }; }
+
+  const { pid, port } = found;
+  if (!pid) return { stopped: false, reason: 'no-pid', port };
+
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (e) {
+    if (e.code === 'ESRCH') { await clearServerState(); return { stopped: true, pid, port }; }
+    if (e.code === 'EPERM') return { stopped: false, reason: 'eperm', pid, port };
+    throw e;
+  }
+
+  if (!(await waitForExit(pid, 6000))) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* may have just exited */ }
+    await waitForExit(pid, 2000);
+  }
+  if (isPidAlive(pid)) return { stopped: false, reason: 'failed', pid, port };
+
+  await clearServerState();
+  return { stopped: true, pid, port };
+}
+
+async function stopCommand() {
+  const r = await stopRunningServer();
+  if (r.stopped) {
+    console.log(`Stopped TeamClaude server (pid ${r.pid}, port ${r.port}).`);
+    return;
+  }
+  switch (r.reason) {
+    case 'not-running':
+      console.log('No TeamClaude server is running.');
+      return;
+    case 'no-pid':
+      console.error(`A server is responding on port ${r.port} but its PID is unknown (lsof unavailable).`);
+      console.error(`Stop it once with:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
+      process.exit(1);
+      break;
+    case 'eperm':
+      console.error(`No permission to signal pid ${r.pid}.`);
+      process.exit(1);
+      break;
+    default:
+      console.error(`Failed to stop pid ${r.pid} on port ${r.port}.`);
+      process.exit(1);
+  }
+}
+
+async function restartCommand() {
+  const r = await stopRunningServer();
+  if (r.stopped) {
+    console.log(`Stopped previous server (pid ${r.pid}).`);
+  } else if (r.reason !== 'not-running') {
+    console.error(`Could not stop the existing server (${r.reason}); aborting restart.`);
+    if (r.reason === 'no-pid') {
+      console.error(`Stop it manually first:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
+    }
+    process.exit(1);
+  }
+  // Wait for the port to be released before re-binding.
+  const port = (await loadConfig())?.proxy?.port;
+  for (let i = 0; i < 20 && await probeServer(port, 500); i++) await delay(150);
+  await serverCommand();
 }
 
 // ── import ──────────────────────────────────────────────────
@@ -386,6 +566,9 @@ async function statusCommand() {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
 
+    const state = await readServerState();
+    const pidStr = state?.pid && isPidAlive(state.pid) ? `pid ${state.pid}, ` : '';
+    console.log(`Server:         running (${pidStr}port ${config.proxy.port})`);
     console.log(`Active account: ${data.currentAccount}`);
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 
@@ -395,6 +578,9 @@ async function statusCommand() {
 
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.status}`);
+      if (acct.maxConcurrent != null) {
+        console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
+      }
 
       if (q.unified5h != null || q.unified7d != null) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
@@ -411,8 +597,9 @@ async function statusCommand() {
       console.log('');
     }
   } catch {
-    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
-    console.error('Is the server running? Start with: teamclaude server');
+    await clearServerState(); // not reachable → drop any stale recorded state
+    console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
+    console.log('Start it with:  teamclaude server');
     process.exit(1);
   }
 }
@@ -600,6 +787,8 @@ Usage: teamclaude [command] [options]
 
 Commands:
   server              Start the proxy server (default)
+  stop                Stop the running proxy server
+  restart             Stop the running server (if any) and start a fresh one
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
@@ -757,7 +946,7 @@ async function resolveAccounts(config) {
       if (acct.importFrom) {
         try {
           const creds = await importCredentials(acct.importFrom);
-          accounts.push({ name: acct.name, type: 'oauth', ...creds });
+          accounts.push({ name: acct.name, type: 'oauth', maxConcurrent: acct.maxConcurrent, ...creds });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
@@ -783,8 +972,9 @@ function handleServerListenError(err, port) {
   if (err.code === 'EADDRINUSE') {
     console.error(`[TeamClaude] Port ${port} is already in use.`);
     console.error('Another TeamClaude proxy may already be running.');
-    console.error('Check the existing server with: teamclaude status');
-    console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
+    console.error('  See it:     teamclaude status');
+    console.error('  Stop it:    teamclaude stop');
+    console.error('  Restart it: teamclaude restart');
   } else if (err.code === 'EACCES') {
     console.error(`[TeamClaude] Permission denied while listening on port ${port}.`);
     console.error('Choose a non-privileged port in the TeamClaude config.');

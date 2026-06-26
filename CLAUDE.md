@@ -8,11 +8,13 @@ TeamClaude is a transparent HTTP proxy that sits between Claude Code and the Ant
 
 ## Commands
 
-There is **no build step and no test suite**. Development is run directly against source.
+There is **no build step**. Development is run directly against source.
 
 ```bash
 node src/index.js <command>        # run any CLI command locally (server is the default)
+node src/index.js stop             # stop the running server (restart = stop + start)
 npm start                          # = node src/index.js (starts the proxy server)
+npm test                           # = node --test  (tests live in test/)
 npx eslint src/                    # lint (flat config in eslint.config.js; no lint npm script)
 
 # Use a throwaway config instead of ~/.config/teamclaude.json:
@@ -31,9 +33,9 @@ TEAMCLAUDE_CONFIG=./config.json node src/index.js server
 
 Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. Six files, each a clear layer:
 
-- **`src/index.js`** — CLI dispatcher + all non-server commands (`import`, `login`, `env`, `status`, `accounts`, `remove`, `api`). Also owns the **config-sync wiring** between the running server, the TUI, and external CLI invocations (see below).
-- **`src/server.js`** — the HTTP proxy and the request-forwarding loop (`forwardRequest`), including account selection, retry, rate-limit handling, SSE streaming, and optional request logging.
-- **`src/account-manager.js`** — `AccountManager` class: in-memory account state, round-robin rotation, quota tracking from response headers, and token-refresh coalescing. The single source of truth for *live* credentials while the server runs.
+- **`src/index.js`** — CLI dispatcher + all non-server commands (`stop`, `restart`, `import`, `login`, `env`, `status`, `accounts`, `remove`, `api`). Owns the **config-sync wiring** between the running server, the TUI, and external CLI invocations (see below), and the **server-lifecycle helpers** (`findRunningServer`/`stopRunningServer` — discover a running proxy via the state file `getServerStatePath()`, falling back to a port probe + `lsof`, then SIGTERM→SIGKILL it; `server` writes the state file on listen and removes it on exit).
+- **`src/server.js`** — the HTTP proxy and the request-forwarding loop (`forwardRequest`), including account acquisition (concurrency slot), retry, rate-limit handling, SSE streaming, and optional request logging.
+- **`src/account-manager.js`** — `AccountManager` class: in-memory account state, use-or-lose selection, **per-account concurrency cap + overflow queue** (`acquireAccount`/`releaseAccount`), quota tracking from response headers, and token-refresh coalescing. The single source of truth for *live* credentials while the server runs.
 - **`src/oauth.js`** — OAuth PKCE login, token refresh, profile fetch, and credential import from Claude Code. No proxy state here — pure functions.
 - **`src/config.js`** — load/save of `~/.config/teamclaude.json` (override via `TEAMCLAUDE_CONFIG`, or `$XDG_CONFIG_HOME`). Written `0o600`.
 - **`src/tui.js`** — full-screen terminal dashboard (alternate screen buffer). Only used when both stdin and stdout are TTYs; otherwise the server logs plainly.
@@ -44,7 +46,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 2. `GET /teamclaude/status` returns `AccountManager.getStatus()` (credential-free).
 3. **`POST /v1/oauth/token` is relayed untouched** (`relayRaw`) — the client manages its own token lifecycle independently of the proxy's. Never intercept or rewrite it; doing so causes token-rotation conflicts.
 4. Body is fully buffered (needed to replay on 429 retry). Hop-by-hop headers, `x-api-key`, and `accept-encoding` are stripped before forwarding (Node `fetch` auto-decompresses, so `content-encoding`/`content-length` are also dropped on the way back).
-5. Account selected via `getActiveAccount()`; OAuth token refreshed if expiring within 5 min.
+5. Account acquired via `acquireAccount()` (reserves one of the account's concurrency slots — see Concurrency below); OAuth token refreshed if expiring within 5 min. The slot is released in the request's `finally`; a failover (429/5xx/error) releases the current slot via `releaseHeld()` before recursing onto another account, while a 401 same-account refresh-retry keeps the slot (`ctx.heldIndex`).
 6. **429 handling classifies the 429 (`isExhausted`, checked after `updateQuota` folds in the response headers) before acting** — never sleep on `retry-after` holding the client connection:
    - **Account-quota exhaustion** (`anthropic-ratelimit-unified-status: rejected`, or measured utilization ≥ threshold): throttle the account for `retry-after` (clamped to `[1s, 5m]`) and immediately re-dispatch to another available account. When *every* account is throttled, `getActiveAccount` returns `null` and the client gets a `429` to back off itself. This keeps cold-start warm-up fast (an exhausted account is skipped in one round-trip, not a 60s stall).
    - **Non-exhaustion 429** (an account request-rate / concurrency limit — token quota left but hit too fast — or a transient/global limit): fail the request *over* to another available account (per-request exclusion via `ctx.tried429`; `getActiveAccount(exclude)` then picks a different account without disturbing the sticky primary). This spreads the concurrent overflow that use-or-lose otherwise pins onto one account, instead of failing. The account is **not throttled** — throttling on a request-global 429 would poison the fleet for unrelated requests. Only once *every* available account has been tried for this request is the 429 passed through to the client. No account state is mutated either way.
@@ -68,6 +70,18 @@ Two header families drive rotation, normalized into one model:
 Selection is then **use-or-lose**, not round-robin: among accounts under the threshold, `_selectBest` picks the one whose **session resets soonest** (`_sessionResetTime`), tie-broken by **lowest session utilization** (`_sessionUtilization`) — so quota that would otherwise reset unused is spent first. Both helpers fall back from unified (Max) to standard (API-key) metrics.
 
 To balance this against Anthropic's per-account prompt cache (separate per org → switching mid-stream causes cache-miss cost), the active account is **sticky**: priority is only re-evaluated once per `reevalIntervalMs` (default 5 min, `config.reevalIntervalMs`), plus immediately whenever the current account becomes unavailable (over threshold / throttled / error). `lastEvalAt = 0` forces a priority pick on the first request. When all accounts are over threshold, `_recoverSoonest` returns the soonest-to-reset (and `getActiveAccount` returns `null` until then, yielding a `429`).
+
+### Concurrency (per-account cap + overflow queue)
+
+`getActiveAccount` alone funnels every concurrent terminal onto the one sticky account, which then hits Anthropic's per-account rate/concurrency limit (429) while other accounts sit idle. `acquireAccount()`/`releaseAccount()` layer **proactive load spreading** on top **without changing `getActiveAccount`** (so its warm-up / use-or-lose / recover behavior — and the tests that pin it — are untouched):
+
+- Each account has `inflight` (in-flight count) and `maxConcurrent` (cap; `config.maxConcurrentPerAccount` default 3, per-account `maxConcurrent` override). `_tryAcquire` folds **capped** accounts into the exclude set and reuses `getActiveAccount(exclude)` to pick the best account *with a free slot* — filling A to its cap, then B, then C, by use-or-lose priority. JS is single-threaded so select→`inflight++` is race-free.
+- When every available account is at its cap, `acquireAccount` **queues** the request (FIFO `_waiters`) up to `config.overflowQueueTimeoutMs` (default 15s); a `releaseAccount` drains waiters. Timeout → `null` → the client gets a `429`. If instead *no account is available at all* (quota-exhausted, not merely capped) it returns `null` immediately (no pointless wait).
+- `forwardRequest` reserves a slot per attempt and releases it on completion (request `finally`) or before a failover recursion (`releaseHeld()`); a 401 same-account refresh-retry keeps the slot. Status/TUI expose `inflight`/`maxConcurrent`.
+
+### Server lifecycle (status / stop / restart)
+
+The running `server` writes a **state file** next to the config (`getServerStatePath()` → `<config>.server.json`: `{ pid, port, startedAt }`) on listen and removes it on exit (a SIGKILL leaves a stale file that the next command detects as dead and cleans up). `findRunningServer` trusts the state file when the pid is alive **and** the port answers a TeamClaude-shaped `/teamclaude/status` (a foreign process on the port is *not* mistaken for ours → falls through to the EADDRINUSE message); otherwise it probes the port + `lsof`s the pid. `stop`/`restart` use this to SIGTERM→(wait)→SIGKILL the server, and `server` refuses to start a duplicate on an occupied port with a pointer to `stop`/`restart` instead of a raw bind error.
 
 ## The thing that's actually hard: config ⇄ memory synchronization
 

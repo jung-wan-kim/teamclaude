@@ -1,5 +1,10 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 
+/** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
+function coerceMaxConcurrent(value, fallback) {
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -18,7 +23,8 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000) {
+  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3) {
+    this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrentDefault, 3);
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -36,6 +42,11 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      // Concurrency: how many requests are in flight through this account right
+      // now, and the per-account cap above which the selector treats it as
+      // momentarily full (so concurrent load spreads to other accounts).
+      inflight: 0,
+      maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
@@ -43,6 +54,7 @@ export class AccountManager {
     this.lastEvalAt = 0; // 0 forces a priority pick on the first request
     this.maxWarmupTries = 3; // give up warming an account after this many unmeasured attempts
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
+    this._waiters = [];      // overflow queue: requests waiting for a free slot
   }
 
   /**
@@ -136,6 +148,136 @@ export class AccountManager {
     }
 
     return current;
+  }
+
+  // ── Concurrency layer: per-account in-flight cap + overflow queue ──────────
+  //
+  // getActiveAccount() above picks ONE account (sticky, use-or-lose). On its own
+  // that funnels every concurrent terminal onto the same account, which then hits
+  // Anthropic's per-account rate / concurrency limit (429) while other accounts
+  // sit idle with quota to spare. The layer below fixes that PROACTIVELY: each
+  // account carries an `inflight` counter and a `maxConcurrent` cap, and
+  // acquireAccount() treats a capped account as momentarily unavailable (folds it
+  // into the exclude set). The existing priority logic then naturally spreads
+  // load to the next account — filling A up to its cap, then B, then C, by
+  // use-or-lose priority. When every available account is at its cap the request
+  // waits briefly for a slot to free (overflow queue) instead of 429-storming.
+
+  /** Has this account a free concurrency slot? */
+  _hasCapacity(account) {
+    return account.inflight < account.maxConcurrent;
+  }
+
+  /** Indexes of available accounts currently at their concurrency cap. */
+  _cappedSet(exclude = null) {
+    const capped = new Set();
+    for (const a of this.accounts) {
+      if (exclude && exclude.has(a.index)) continue;
+      if (this._isAvailable(a) && !this._hasCapacity(a)) capped.add(a.index);
+    }
+    return capped;
+  }
+
+  /** Is there an available account with a free slot (not excluded)? Non-mutating. */
+  anyUsable(exclude = null) {
+    return this.accounts.some(a =>
+      this._isAvailable(a) && this._hasCapacity(a) && !(exclude && exclude.has(a.index)));
+  }
+
+  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. */
+  anyCapped(exclude = null) {
+    return this.accounts.some(a =>
+      this._isAvailable(a) && !this._hasCapacity(a) && !(exclude && exclude.has(a.index)));
+  }
+
+  /**
+   * Synchronously pick + reserve the best account that is available AND has a
+   * free concurrency slot, honoring `exclude`. Capped accounts are folded into
+   * the exclusion so the existing getActiveAccount / _selectBest priority logic
+   * (warm-up, use-or-lose, recover) only ever chooses an account that can take
+   * the request. Increments the chosen account's inflight. Returns null when
+   * nothing is currently acquirable (all exhausted, excluded, or capped).
+   *
+   * Single-threaded JS keeps this race-free: there is no await between selecting
+   * the account and the inflight++ that reserves its slot.
+   */
+  _tryAcquire(exclude = null) {
+    const capped = this._cappedSet(exclude);
+    const eff = ((exclude && exclude.size) || capped.size)
+      ? new Set([...(exclude || []), ...capped])
+      : null;
+    // eff === null → full sticky / warm-up path (cold start, nothing capped).
+    // eff set → getActiveAccount routes to _selectBest(eff), which already skips
+    // every excluded + capped account.
+    const account = eff ? this.getActiveAccount(eff) : this.getActiveAccount();
+    if (account && this._isAvailable(account) && this._hasCapacity(account)
+        && !(eff && eff.has(account.index))) {
+      account.inflight++;
+      return account;
+    }
+    return null;
+  }
+
+  /**
+   * Acquire an account for a request, reserving one of its concurrency slots.
+   * If none is immediately acquirable but an available account is merely at its
+   * cap (overflow), wait up to `timeoutMs` for a slot to free — a releaseAccount
+   * elsewhere wakes the waiter. Returns null when every account is genuinely
+   * unavailable (quota-exhausted / auth-error / excluded) or the wait times out,
+   * so the caller surfaces a 429 for the client to back off on.
+   *
+   * The caller MUST releaseAccount(account.index) exactly once when the request
+   * (including any streamed body) finishes.
+   */
+  async acquireAccount(exclude = null, timeoutMs = 0) {
+    const account = this._tryAcquire(exclude);
+    if (account) return account;
+    // Queue only when the blockage is cap-saturation (a slot WILL free as
+    // in-flight requests finish). If no available account exists at all, queuing
+    // would just stall until timeout, so return null and let the caller 429.
+    if (timeoutMs <= 0 || !this.anyCapped(exclude)) return null;
+    return this._enqueue(exclude, timeoutMs);
+  }
+
+  _enqueue(exclude, timeoutMs) {
+    return new Promise(resolve => {
+      const waiter = { exclude, resolve, done: false, timer: null };
+      waiter.timer = setTimeout(() => {
+        if (waiter.done) return;
+        waiter.done = true;
+        const i = this._waiters.indexOf(waiter);
+        if (i >= 0) this._waiters.splice(i, 1);
+        resolve(null);
+      }, timeoutMs);
+      this._waiters.push(waiter);
+    });
+  }
+
+  /**
+   * Release a concurrency slot held by a request and hand any freed capacity to
+   * the longest-waiting overflow request that can use it (FIFO, but a waiter
+   * whose exclude set can't currently be satisfied is skipped rather than
+   * head-of-line blocking a later waiter that can run).
+   */
+  releaseAccount(index) {
+    const account = this.accounts[index];
+    if (account && account.inflight > 0) account.inflight--;
+    this._drainWaiters();
+  }
+
+  _drainWaiters() {
+    for (let i = 0; i < this._waiters.length;) {
+      const waiter = this._waiters[i];
+      const account = this._tryAcquire(waiter.exclude);
+      if (account) {
+        waiter.done = true;
+        clearTimeout(waiter.timer);
+        this._waiters.splice(i, 1);
+        waiter.resolve(account);
+      } else {
+        i++;
+      }
+    }
   }
 
   /**
@@ -508,6 +650,8 @@ export class AccountManager {
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      inflight: 0,
+      maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
     });
     return index;
   }
@@ -539,6 +683,8 @@ export class AccountManager {
         status: a.status,
         quota: { ...a.quota },
         usage: { ...a.usage },
+        inflight: a.inflight,
+        maxConcurrent: a.maxConcurrent,
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,
