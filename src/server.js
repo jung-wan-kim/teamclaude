@@ -23,6 +23,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
+  // Connection affinity: keep one client connection's sequential requests on the
+  // same account for prompt-cache locality (HTTP/1.1 keep-alive reuses the socket
+  // for a session's sequential turns). Soft — overflow still spreads. Set
+  // `sessionAffinity: false` to route purely by use-or-lose every request instead.
+  const sessionAffinity = config.sessionAffinity !== false;
   let requestCounter = 0;
   let inFlightProxied = 0; // proxied (non-status/oauth) requests currently being handled
 
@@ -83,7 +88,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const reqId = ++requestCounter;
         hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
-        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs, abortSignal: null };
+        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -268,7 +273,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (ctx.heldIndex != null) {
     account = accountManager.accounts[ctx.heldIndex];
   } else {
-    account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal);
+    account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal, ctx.affinityKey);
     if (account) ctx.heldIndex = account.index;
   }
   const releaseHeld = () => {

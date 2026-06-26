@@ -148,6 +148,79 @@ test('proxy rejects an over-sized request body with 413 (bounded buffering)', as
   proxy.close();
 });
 
+// ── unit: connection affinity (prompt-cache locality) ─────────────────────
+
+test('affinity keeps a connection\'s sequential requests on the same account', async () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 3);
+  measureAll(am);
+  const key = {}; // stand-in for a client socket object
+
+  const a1 = await am.acquireAccount(null, 0, null, key); am.releaseAccount(a1.index);
+  const a2 = await am.acquireAccount(null, 0, null, key); am.releaseAccount(a2.index);
+  const a3 = await am.acquireAccount(null, 0, null, key);
+
+  assert.equal(a2.index, a1.index, 'second sequential request reuses the first account');
+  assert.equal(a3.index, a1.index, 'third too — cache stays warm on one account');
+});
+
+test('affinity is a soft preference: spills when the preferred account is capped', async () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 1); // cap 1/account
+  measureAll(am);
+  const key = {};
+
+  const a1 = await am.acquireAccount(null, 0, null, key);  // takes account X, fills its only slot
+  const a2 = await am.acquireAccount(null, 0, null, key);  // same key, but X capped → must spill
+
+  assert.notEqual(a2.index, a1.index, 'affinity must never exceed the per-account cap');
+  assert.equal(am.accounts[a1.index].inflight, 1);
+  assert.equal(am.accounts[a2.index].inflight, 1);
+});
+
+test('affinity falls through when the preferred account becomes unavailable', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  measureAll(am);
+  const key = {};
+
+  const a1 = await am.acquireAccount(null, 0, null, key);
+  am.releaseAccount(a1.index);
+
+  // Exhaust the affined account's quota → it's no longer available.
+  am.updateQuota(a1.index, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.99',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+
+  const a2 = await am.acquireAccount(null, 0, null, key);
+  assert.notEqual(a2.index, a1.index, 'must move off the exhausted affined account');
+});
+
+test('affinity holds a connection on its account when the sticky primary moves to a better one', async () => {
+  // reeval ON (1ms) so use-or-lose can move the global primary mid-stream — the
+  // exact case that used to mass-bust the prompt cache. Affinity must shield a
+  // live connection from that move while NEW connections follow the new primary.
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(2), 0.98, 1, 3);
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 2 * HOUR) / 1000)) });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 2 * HOUR) / 1000)) });
+
+  const key = {};
+  const first = await am.acquireAccount(null, 0, null, key);
+  am.releaseAccount(first.index);
+  const other = first.index === 0 ? 1 : 0;
+
+  // Make `other` reset sooner → use-or-lose now prefers it; wait past the interval.
+  am.updateQuota(other, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 60_000) / 1000)) });
+  await new Promise(r => setTimeout(r, 5));
+
+  // A fresh connection follows the re-prioritized primary…
+  const fresh = await am.acquireAccount(null, 0, null, {}); am.releaseAccount(fresh.index);
+  assert.equal(fresh.index, other, 'a new connection routes to the now-better account');
+
+  // …but the affined connection stays put, keeping its prompt cache warm.
+  const again = await am.acquireAccount(null, 0, null, key);
+  assert.equal(again.index, first.index, 'affinity shields the existing connection from the primary move');
+});
+
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
 test('proxy caps concurrent in-flight per account and still serves every request', async () => {

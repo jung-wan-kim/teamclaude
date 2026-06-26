@@ -6,6 +6,7 @@
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "maxConcurrentPerAccount": 3,
+  "sessionAffinity": true,
   "overflowQueueTimeoutMs": 15000,
   "accounts": [
     {

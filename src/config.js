@@ -47,6 +47,11 @@ export function createDefaultConfig() {
     // next account (per-account `maxConcurrent` overrides this). Tune to just
     // below where one account starts returning rate/concurrency 429s.
     maxConcurrentPerAccount: 3,
+    // Keep one client connection's sequential requests on the same account so
+    // Anthropic's per-account prompt cache stays warm (a session's turns reuse
+    // the keep-alive socket). Soft: concurrent overflow still spreads to other
+    // accounts. Set false to route every request purely by use-or-lose priority.
+    sessionAffinity: true,
     // How long (ms) a request waits for a free slot when every account is at its
     // cap, before returning 429. 0 = never queue.
     overflowQueueTimeoutMs: 15000,

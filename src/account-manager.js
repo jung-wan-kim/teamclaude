@@ -60,6 +60,13 @@ export class AccountManager {
     this.maxWarmupTries = 3; // give up warming an account after this many unmeasured attempts
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
+    // Soft connection→account affinity (keyed by the client socket). Keeps one
+    // keep-alive connection's *sequential* requests on the same account so
+    // Anthropic's per-account prompt cache stays warm. A WeakMap so an entry is
+    // GC'd when the socket is collected (connection closed) — no manual cleanup,
+    // no leak. The stored value is the account *object* (not its index, which
+    // shifts on removeAccount); a stale entry is detected and ignored.
+    this._affinity = new WeakMap();
   }
 
   /**
@@ -206,7 +213,24 @@ export class AccountManager {
    * Single-threaded JS keeps this race-free: there is no await between selecting
    * the account and the inflight++ that reserves its slot.
    */
-  _tryAcquire(exclude = null) {
+  _tryAcquire(exclude = null, affinityKey = null) {
+    // Connection affinity (cache locality): if this client connection already
+    // used an account, prefer it — but only as a *soft* hint. Honor it only when
+    // that account is still available, has a free slot, and isn't excluded for
+    // this request; otherwise fall through to normal selection. This never
+    // exceeds the per-account cap or revives an exhausted account, so the 429
+    // guarantees and use-or-lose routing for *new* connections are untouched.
+    // (The identity check `accounts[idx] === a` rejects a stale entry left by a
+    // removeAccount that re-indexed the array.)
+    if (affinityKey) {
+      const a = this._affinity.get(affinityKey);
+      if (a && this.accounts[a.index] === a && this._isAvailable(a)
+          && this._hasCapacity(a) && !(exclude && exclude.has(a.index))) {
+        a.inflight++;
+        return a;
+      }
+    }
+
     const capped = this._cappedSet(exclude);
     const eff = ((exclude && exclude.size) || capped.size)
       ? new Set([...(exclude || []), ...capped])
@@ -218,6 +242,7 @@ export class AccountManager {
     if (account && this._isAvailable(account) && this._hasCapacity(account)
         && !(eff && eff.has(account.index))) {
       account.inflight++;
+      if (affinityKey) this._affinity.set(affinityKey, account); // remember for this connection
       return account;
     }
     return null;
@@ -234,16 +259,16 @@ export class AccountManager {
    * The caller MUST releaseAccount(account.index) exactly once when the request
    * (including any streamed body) finishes.
    */
-  async acquireAccount(exclude = null, timeoutMs = 0, signal = null) {
+  async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null) {
     if (signal?.aborted) return null;
-    const account = this._tryAcquire(exclude);
+    const account = this._tryAcquire(exclude, affinityKey);
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
     if (timeoutMs <= 0 || !this.anyCapped(exclude) || this.isQueueFull()) return null;
-    return this._enqueue(exclude, timeoutMs, signal);
+    return this._enqueue(exclude, timeoutMs, signal, affinityKey);
   }
 
   /** Is the overflow queue at its depth cap? */
@@ -256,9 +281,9 @@ export class AccountManager {
     return this.accounts.reduce((sum, a) => sum + a.maxConcurrent, 0) + this.maxQueueDepth;
   }
 
-  _enqueue(exclude, timeoutMs, signal = null) {
+  _enqueue(exclude, timeoutMs, signal = null, affinityKey = null) {
     return new Promise(resolve => {
-      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null };
+      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey };
       waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
       // Cancel the wait if the client disconnects — otherwise an aborted request
       // would still acquire a slot later and be dispatched upstream, burning quota.
@@ -297,7 +322,7 @@ export class AccountManager {
   _drainWaiters() {
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
-      const account = this._tryAcquire(waiter.exclude);
+      const account = this._tryAcquire(waiter.exclude, waiter.affinityKey);
       if (!account) { i++; continue; }
       // _settleWaiter splices the waiter out, so don't advance i. If it was
       // already settled (shouldn't happen — settled waiters aren't in the list),
