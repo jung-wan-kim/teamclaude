@@ -101,6 +101,53 @@ test('releaseAccount never drives inflight below zero', () => {
   assert.equal(am.accounts[0].inflight, 0);
 });
 
+test('overflow queue is bounded: rejects past maxQueueDepth instead of growing', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 2); // cap 1, queue depth 2
+  measureAll(am);
+  await am.acquireAccount(null, 5000); // fill the only slot
+
+  const w1 = am.acquireAccount(null, 5000); // queued (depth 1)
+  const w2 = am.acquireAccount(null, 5000); // queued (depth 2)
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(am._waiters.length, 2);
+
+  const over = await am.acquireAccount(null, 5000); // depth full → immediate null
+  assert.equal(over, null);
+  assert.equal(am._waiters.length, 2, 'queue must not grow past its depth cap');
+
+  // drain so the queued waiters' timers are cleared (no dangling handles)
+  am.releaseAccount(0);
+  const a1 = await w1; assert.ok(a1);
+  am.releaseAccount(a1.index);
+  const a2 = await w2; assert.ok(a2);
+  am.releaseAccount(a2.index);
+});
+
+test('proxy rejects an over-sized request body with 413 (bounded buffering)', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxRequestBytes: 1024, // 1 KiB cap for the test
+  });
+  const port = await listen(proxy);
+
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: 'x'.repeat(5000),
+  });
+  assert.equal(res.status, 413);
+
+  upstream.close();
+  proxy.close();
+});
+
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
 test('proxy caps concurrent in-flight per account and still serves every request', async () => {

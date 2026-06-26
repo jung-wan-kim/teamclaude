@@ -18,6 +18,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const queueTimeoutMs = Number.isFinite(config.overflowQueueTimeoutMs)
     ? Math.max(0, config.overflowQueueTimeoutMs)
     : 15000;
+  // Cap the buffered request body. The proxy must buffer the whole body to replay
+  // it across accounts on a 429/5xx, so an unbounded body is an unbounded buffer.
+  const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
+    ? config.maxRequestBytes
+    : 32 * 1024 * 1024;
   let requestCounter = 0;
 
   if (logDir) {
@@ -58,10 +63,40 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const reqId = ++requestCounter;
       hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
-      // Buffer request body (needed for retry on 429)
+      // Fast-reject when the fleet has no free slot AND the overflow queue is full,
+      // before buffering a body we'd only drop. Bounds backlog memory under a flood
+      // (localhost auth is skipped, so any local process could otherwise pile on).
+      // The per-account cap + bounded queue in acquireAccount are the authoritative
+      // limits; this is the cheap early-out.
+      if (!accountManager.anyUsable() && accountManager.isQueueFull()) {
+        req.resume(); // drain & discard the body so the socket isn't leaked
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'Proxy overloaded; retry shortly.' },
+        }));
+        return;
+      }
+
+      // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
       const bodyChunks = [];
+      let bodyLen = 0;
+      let bodyTooLarge = false;
       for await (const chunk of req) {
+        bodyLen += chunk.length;
+        if (bodyLen > maxBodyBytes) { bodyTooLarge = true; break; }
         bodyChunks.push(chunk);
+      }
+      if (bodyTooLarge) {
+        req.destroy();
+        if (!res.headersSent) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` },
+          }));
+        }
+        return;
       }
       const body = Buffer.concat(bodyChunks);
 

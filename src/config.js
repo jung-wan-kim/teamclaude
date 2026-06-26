@@ -50,6 +50,9 @@ export function createDefaultConfig() {
     // How long (ms) a request waits for a free slot when every account is at its
     // cap, before returning 429. 0 = never queue.
     overflowQueueTimeoutMs: 15000,
+    // Hard caps that bound proxy memory under a request flood.
+    overflowQueueMaxDepth: 256,        // max queued requests before 429
+    maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413
     accounts: [],
   };
 }

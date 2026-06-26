@@ -23,8 +23,13 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3) {
+  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256) {
     this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrentDefault, 3);
+    // Hard cap on the overflow queue so a flood of concurrent requests can't grow
+    // it (and the buffered bodies / sockets / timers it pins) without bound. Past
+    // this depth acquireAccount rejects immediately (→ 429) instead of queuing.
+    this.maxQueueDepth = Number.isFinite(overflowQueueMaxDepth) && overflowQueueMaxDepth >= 0
+      ? Math.floor(overflowQueueMaxDepth) : 256;
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -233,10 +238,16 @@ export class AccountManager {
     const account = this._tryAcquire(exclude);
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
-    // in-flight requests finish). If no available account exists at all, queuing
-    // would just stall until timeout, so return null and let the caller 429.
-    if (timeoutMs <= 0 || !this.anyCapped(exclude)) return null;
+    // in-flight requests finish) AND the queue isn't already full. If no
+    // available account exists at all, or the queue is at its depth cap, return
+    // null and let the caller 429 — never grow the backlog without bound.
+    if (timeoutMs <= 0 || !this.anyCapped(exclude) || this.isQueueFull()) return null;
     return this._enqueue(exclude, timeoutMs);
+  }
+
+  /** Is the overflow queue at its depth cap? */
+  isQueueFull() {
+    return this._waiters.length >= this.maxQueueDepth;
   }
 
   _enqueue(exclude, timeoutMs) {

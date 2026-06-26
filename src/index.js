@@ -108,7 +108,12 @@ async function serverCommand() {
   const maxConcurrentDefault = Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1
     ? config.maxConcurrentPerAccount
     : 3;
-  const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault);
+  // Hard cap on the overflow wait-queue (requests waiting for a free slot when
+  // every account is at its cap). Bounds memory/FDs under a request flood.
+  const overflowQueueMaxDepth = Number.isFinite(config.overflowQueueMaxDepth) && config.overflowQueueMaxDepth >= 0
+    ? config.overflowQueueMaxDepth
+    : 256;
+  const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault, overflowQueueMaxDepth);
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -299,25 +304,34 @@ function lsofPid(port) {
 }
 
 /**
- * Locate a running TeamClaude server for this config. Trusts the recorded state
- * file (pid + port) when the pid is alive AND the port answers; otherwise clears
- * a stale file and falls back to probing the config's port (+ lsof for the pid),
- * so even a server started before state tracking can still be found. Returns
- * { pid, port } (pid may be null if only discoverable by port), or null.
+ * Locate a running TeamClaude server for this config's port, returning the pid
+ * that ACTUALLY owns the listening socket — never a pid taken on faith from the
+ * state file. That matters because a state file can be stale (the recorded pid
+ * died and the OS recycled it for an unrelated process) or hand-written; trusting
+ * it would let `stop` signal the wrong pid. So: confirm a TeamClaude-shaped server
+ * answers on the port, then resolve the owner via `lsof`. The state file is only a
+ * fallback for the pid when lsof can't determine it (and only if it's alive and
+ * for this same port). Returns { pid, port } (pid may be null if undeterminable),
+ * or null when nothing is listening.
  */
 async function findRunningServer(config) {
   const port = config?.proxy?.port;
+
+  if (!(await probeServer(port))) {
+    if (await readServerState()) await clearServerState(); // nothing here → drop stale state
+    return null;
+  }
+
+  const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
+  if (ownerPid) return { pid: ownerPid, port };
+
+  // lsof unavailable: fall back to the recorded pid only if it is alive AND was
+  // recorded for THIS port (so a stale pid for a different port can't be signaled).
   const state = await readServerState();
-
-  if (state?.pid && isPidAlive(state.pid) && await probeServer(state.port)) {
-    return { pid: state.pid, port: state.port };
+  if (state?.pid && state.port === port && isPidAlive(state.pid)) {
+    return { pid: state.pid, port };
   }
-  if (state) await clearServerState(); // stale: dead pid or unreachable
-
-  if (await probeServer(port)) {
-    return { pid: lsofPid(port), port };
-  }
-  return null;
+  return { pid: null, port };
 }
 
 /**
