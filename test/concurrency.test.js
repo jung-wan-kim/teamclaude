@@ -291,18 +291,73 @@ test('a transient per-request failover does not rewrite a connection\'s affinity
 
   const first = await am.acquireAccount(null, 0, null, key);
   const home = first.index;
-  am.releaseAccount(home);
+  am.releaseAccount(first);
 
   // Simulate THIS request failing over off `home` (per-request exclude, as a
-  // transient 429/5xx does). The retry must pick a different account but must
-  // NOT adopt it as the connection's new home.
-  const fb = await am.acquireAccount(new Set([home]), 0, null, key);
+  // transient 429/5xx does). The exclude set holds the account OBJECT. The retry
+  // must pick a different account but must NOT adopt it as the connection's home.
+  const fb = await am.acquireAccount(new Set([first]), 0, null, key);
   assert.notEqual(fb.index, home, 'failover picks a different account');
-  am.releaseAccount(fb.index);
+  am.releaseAccount(fb);
 
   // The next normal request on the same connection returns to its warm home.
   const next = await am.acquireAccount(null, 0, null, key);
   assert.equal(next.index, home, 'affinity stays on the home account after a transient failover');
+});
+
+// ── unit: index handles survive a runtime removeAccount() ─────────────────
+
+test('releaseAccount by object frees the right slot after a concurrent removeAccount re-index', async () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 1); // cap 1
+  measureAll(am);
+
+  const x = await am.acquireAccount(null, 0, null, null); // holds some account
+  const y = await am.acquireAccount(null, 0, null, null); // holds another
+  assert.notEqual(x.index, y.index);
+  assert.equal(x.inflight, 1);
+  assert.equal(y.inflight, 1);
+
+  // Admin deletes a *third*, still-idle account → the array re-indexes, shifting
+  // x/y to new index numbers. Releasing by OBJECT must still hit the right slots.
+  const idle = am.accounts.find(a => a !== x && a !== y);
+  am.removeAccount(idle.index);
+
+  am.releaseAccount(x);
+  am.releaseAccount(y);
+  assert.equal(x.inflight, 0, 'x slot released despite re-index');
+  assert.equal(y.inflight, 0, 'y slot released despite re-index');
+  // both are acquirable again (cap accounting intact, not leaked)
+  const z = await am.acquireAccount(null, 0, null, null);
+  assert.ok(z, 'a slot is available again — no leak from the re-index');
+});
+
+test('removing the account that holds a slot does not underflow a surviving account', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 1); // cap 1
+  measureAll(am);
+
+  const a = await am.acquireAccount(null, 0, null, null); // a.index = 0 (say)
+  const b = await am.acquireAccount(null, 0, null, null); // b.index = 1
+  // Remove the account that is itself in flight; b shifts down to index 0.
+  am.removeAccount(a.index);
+  // Releasing the removed account's own object must not touch the survivor.
+  am.releaseAccount(a);
+  assert.equal(b.inflight, 1, 'survivor slot untouched by releasing the removed account');
+  // Survivor releases correctly by object.
+  am.releaseAccount(b);
+  assert.equal(b.inflight, 0);
+});
+
+test('a failover exclude set skips the right account after a re-index (object identity)', async () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 5);
+  measureAll(am);
+  const bad = am.accounts[1]; // the account to keep excluded
+
+  // Remove account 0 → `bad` shifts from index 1 to index 0. An index-based
+  // exclude would now wrongly skip whoever sits at index 1; an object-based one
+  // still skips `bad`.
+  am.removeAccount(0);
+  const picked = await am.acquireAccount(new Set([bad]), 0, null, null);
+  assert.notEqual(picked, bad, 'the excluded account is still skipped after the re-index');
 });
 
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────

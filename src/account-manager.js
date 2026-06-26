@@ -97,7 +97,7 @@ export class AccountManager {
     const now = Date.now();
 
     // Per-request failover: a prior account already returned a non-quota 429
-    // for THIS request (its indexes are in `exclude`). Pick another available
+    // for THIS request (those accounts are in `exclude`, a Set of objects). Pick another available
     // account by priority WITHOUT touching the sticky primary or warm-up state
     // — this diverts only the overflow of one request; steady-state selection
     // still prefers the use-or-lose primary, keeping its prompt cache warm.
@@ -180,26 +180,31 @@ export class AccountManager {
     return account.inflight < account.maxConcurrent;
   }
 
-  /** Indexes of available accounts currently at their concurrency cap. */
+  /**
+   * Available accounts currently at their concurrency cap, as a Set of account
+   * OBJECTS (not indexes). Object identity is stable across a removeAccount()
+   * re-index, so an exclude/capped set captured before the request awaits
+   * upstream can't later point at the wrong account.
+   */
   _cappedSet(exclude = null) {
     const capped = new Set();
     for (const a of this.accounts) {
-      if (exclude && exclude.has(a.index)) continue;
-      if (this._isAvailable(a) && !this._hasCapacity(a)) capped.add(a.index);
+      if (exclude && exclude.has(a)) continue;
+      if (this._isAvailable(a) && !this._hasCapacity(a)) capped.add(a);
     }
     return capped;
   }
 
-  /** Is there an available account with a free slot (not excluded)? Non-mutating. */
+  /** Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.) */
   anyUsable(exclude = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a) && this._hasCapacity(a) && !(exclude && exclude.has(a.index)));
+      this._isAvailable(a) && this._hasCapacity(a) && !(exclude && exclude.has(a)));
   }
 
-  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. */
+  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) */
   anyCapped(exclude = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a) && !this._hasCapacity(a) && !(exclude && exclude.has(a.index)));
+      this._isAvailable(a) && !this._hasCapacity(a) && !(exclude && exclude.has(a)));
   }
 
   /**
@@ -238,7 +243,7 @@ export class AccountManager {
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
       if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a)
-          && this._hasCapacity(a) && !(exclude && exclude.has(a.index))) {
+          && this._hasCapacity(a) && !(exclude && exclude.has(a))) {
         a.inflight++;
         return a;
       }
@@ -253,7 +258,7 @@ export class AccountManager {
     // every excluded + capped account.
     const account = eff ? this.getActiveAccount(eff) : this.getActiveAccount();
     if (account && this._isAvailable(account) && this._hasCapacity(account)
-        && !(eff && eff.has(account.index))) {
+        && !(eff && eff.has(account))) {
       account.inflight++;
       // (Re)write affinity ONLY when the connection has no still-usable home.
       // Reaching this fall-through path means we left the home account — but that
@@ -281,8 +286,10 @@ export class AccountManager {
    * unavailable (quota-exhausted / auth-error / excluded) or the wait times out,
    * so the caller surfaces a 429 for the client to back off on.
    *
-   * The caller MUST releaseAccount(account.index) exactly once when the request
-   * (including any streamed body) finishes.
+   * The caller MUST releaseAccount(account) exactly once when the request
+   * (including any streamed body) finishes — pass the returned account OBJECT,
+   * not its index, so a concurrent removeAccount() can't misattribute the slot.
+   * `exclude` is a Set of account OBJECTS (per-request failover).
    */
   async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null) {
     if (signal?.aborted) return null;
@@ -338,8 +345,14 @@ export class AccountManager {
    * whose exclude set can't currently be satisfied is skipped rather than
    * head-of-line blocking a later waiter that can run).
    */
-  releaseAccount(index) {
-    const account = this.accounts[index];
+  releaseAccount(accountOrIndex) {
+    // Accept the account OBJECT (what the server holds — reindex-safe across a
+    // removeAccount) or, for convenience/tests, a numeric index. Resolving to the
+    // object means a release decrements the slot of the *account that was
+    // acquired*, never whatever happens to sit at that index now.
+    const account = typeof accountOrIndex === 'number'
+      ? this.accounts[accountOrIndex]
+      : accountOrIndex;
     if (account && account.inflight > 0) account.inflight--;
     this._drainWaiters();
   }
@@ -361,13 +374,13 @@ export class AccountManager {
    * session reset first, then lowest session utilization. Falls back to the
    * soonest-resetting account when none are currently available.
    *
-   * `exclude` (a Set of indexes) is used for per-request failover: those
+   * `exclude` (a Set of account objects) is used for per-request failover: those
    * accounts are skipped, and when nothing else is eligible this returns null
    * (instead of recovering one) so the caller can pass the 429 through.
    */
   _selectBest(exclude = null) {
-    const has = i => (exclude ? exclude.has(i) : false);
-    const eligible = this.accounts.filter(a => this._isAvailable(a) && !has(a.index));
+    const has = a => (exclude ? exclude.has(a) : false);
+    const eligible = this.accounts.filter(a => this._isAvailable(a) && !has(a));
     if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
 
     eligible.sort((a, b) => {

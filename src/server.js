@@ -88,7 +88,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const reqId = ++requestCounter;
         hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
-        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null };
+        // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
+        // `held` is the acquired account OBJECT — both stable across a concurrent
+        // removeAccount() re-index, so a release/exclude can't target the wrong account.
+        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -139,9 +142,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // Release the concurrency slot held by this request (if any). A failover
           // releases the previous account before re-acquiring, so at this point only
           // the last-held slot remains; releaseAccount guards against double-release.
-          if (ctx.heldIndex != null) {
-            accountManager.releaseAccount(ctx.heldIndex);
-            ctx.heldIndex = null;
+          if (ctx.held != null) {
+            accountManager.releaseAccount(ctx.held);
+            ctx.held = null;
           }
           hooks.onRequestEnd?.(reqId, {
             method: req.method, path: req.url,
@@ -265,21 +268,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     : null;
 
   // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
-  // the slot is already held (ctx.heldIndex set, exclude unchanged) → reuse it.
+  // the slot is already held (ctx.held set, exclude unchanged) → reuse it.
   // Otherwise acquire a fresh slot, waiting briefly if every available account is
   // at its cap (overflow queue) before giving up with a 429. Releasing this slot
   // before any account-switching retry is the caller's job, via releaseHeld().
   let account;
-  if (ctx.heldIndex != null) {
-    account = accountManager.accounts[ctx.heldIndex];
+  if (ctx.held != null) {
+    account = ctx.held;
   } else {
     account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal, ctx.affinityKey);
-    if (account) ctx.heldIndex = account.index;
+    if (account) ctx.held = account;
   }
   const releaseHeld = () => {
-    if (ctx.heldIndex != null) {
-      accountManager.releaseAccount(ctx.heldIndex);
-      ctx.heldIndex = null;
+    if (ctx.held != null) {
+      accountManager.releaseAccount(ctx.held);
+      ctx.held = null;
     }
   };
 
@@ -406,9 +409,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       await upstreamRes.body?.cancel();
 
       if (account.type === 'oauth' && account.refreshToken
-          && !ctx.authRetried.has(account.index)
+          && !ctx.authRetried.has(account)
           && retryCount < maxRetries && !res.destroyed) {
-        ctx.authRetried.add(account.index);
+        ctx.authRetried.add(account);
         console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
         await accountManager.ensureTokenFresh(account.index, true);
         // ensureTokenFresh only marks 'error' for an expired token; a successful
@@ -505,7 +508,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // the fleet for unrelated requests. Only when every available account has
       // been tried for this request (→ effectively global) is the 429 passed
       // through to the client; no account state is mutated either way.
-      ctx.tried429.add(account.index);
+      ctx.tried429.add(account);
       if (!res.destroyed && retryCount < maxRetries
           && (accountManager.anyUsable(ctx.tried429) || accountManager.anyCapped(ctx.tried429))) {
         console.log(`[TeamClaude] 429 (rate/transient) on "${account.name}" — switching account for this request`);
@@ -554,7 +557,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
 
       // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this request.
-      ctx.tried5xx.add(account.index);
+      ctx.tried5xx.add(account);
       const exclude5xx = new Set([...ctx.tried429, ...ctx.tried5xx]);
       if (!res.destroyed && retryCount < maxRetries
           && (accountManager.anyUsable(exclude5xx) || accountManager.anyCapped(exclude5xx))) {
