@@ -104,3 +104,47 @@ test('all accounts 529 → bounded backoff retries, then passes 529 through (no 
     delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
   }
 });
+
+// Codex P2 regression: TEAMCLAUDE_OVERLOAD_RETRIES=0 must actually DISABLE the
+// proxy-held backoff retries (an operator escape hatch during an incident). An
+// explicit 0 is falsy, so `parseInt(...) || 6` used to silently fall back to 6 —
+// envInt()'s Number.isFinite guard fixes that. With 0 the request still fails over
+// across accounts once, then passes the 529 straight through with NO backoff sleep.
+test('TEAMCLAUDE_OVERLOAD_RETRIES=0 disables backoff — failover sweep then immediate passthrough', async () => {
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '0';
+  // Make a default-6 fallback obvious if the knob were ignored: each backoff would
+  // sleep ≥1s, so honoring 0 keeps this well under that.
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    overloaded529(res);
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    const elapsed = Date.now() - started;
+    assert.equal(res.status, 529);                                  // surfaced — retries disabled
+    assert.ok(elapsed < 900, `expected no backoff sleep with retries=0, took ${elapsed}ms`);
+    assert.equal(upstreamHits, 2, `expected one failover sweep (no backoff rounds), got ${upstreamHits}`);
+    assert.ok(am.accounts.every(a => a.status !== 'throttled' && a.status !== 'error'),
+      `expected no account poisoned, got ${am.accounts.map(a => a.status).join(',')}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+    delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+  }
+});

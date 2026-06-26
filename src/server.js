@@ -156,6 +156,15 @@ function formatHeaders(headers) {
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// parseInt with a default that HONORS an explicit 0 — unlike `parseInt(...) || def`,
+// which discards a valid 0 (0 is falsy). e.g. TEAMCLAUDE_OVERLOAD_RETRIES=0 must
+// actually disable proxy-held backoff retries during an incident, not fall back to
+// the default. Mirrors the Number.isFinite guard used for reevalIntervalMs in index.js.
+const envInt = (name, def) => {
+  const v = parseInt(process.env[name], 10);
+  return Number.isFinite(v) ? v : def;
+};
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
@@ -424,9 +433,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const code = upstreamRes.status;
       await upstreamRes.body?.cancel();
 
-      const maxOverload = Math.max(0, parseInt(process.env.TEAMCLAUDE_OVERLOAD_RETRIES, 10) || 6);
-      const backoffBase = Math.max(50, parseInt(process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS, 10) || 1000);
-      const backoffCap = Math.max(backoffBase, parseInt(process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS, 10) || 10000);
+      const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+      const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
+      const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
 
       // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this request.
       ctx.tried5xx.add(account.index);
