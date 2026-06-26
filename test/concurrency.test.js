@@ -191,3 +191,91 @@ test('proxy caps concurrent in-flight per account and still serves every request
   upstream.close();
   proxy.close();
 });
+
+test('a queued request cancelled by client disconnect never reaches upstream', async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    hits++;
+    await new Promise(r => setTimeout(r, 250)); // hold the slot so the 2nd request queues
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1); // cap 1
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, overflowQueueTimeoutMs: 5000,
+  });
+  const port = await listen(proxy);
+
+  const p1 = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' });
+  await new Promise(r => setTimeout(r, 60)); // req1 acquires the slot + reaches upstream
+
+  const ac = new AbortController();
+  const p2 = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}', signal: ac.signal })
+    .catch(() => 'aborted');
+  await new Promise(r => setTimeout(r, 60)); // req2 enqueues behind the full slot
+  assert.equal(am._waiters.length, 1, 'req2 should be queued');
+
+  ac.abort(); // client disconnects while queued
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(am._waiters.length, 0, 'aborted waiter must be removed');
+
+  await p1; await p2;
+  await new Promise(r => setTimeout(r, 150)); // window for any erroneous dispatch
+  assert.equal(hits, 1, 'cancelled queued request must not reach upstream');
+
+  upstream.close();
+  proxy.close();
+});
+
+test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, maxRequestBytes: 1024,
+  });
+  const port = await listen(proxy);
+
+  const res = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: 'x'.repeat(5000),
+  });
+  assert.equal(res.status, 413);
+
+  upstream.close();
+  proxy.close();
+});
+
+test('global admission cap rejects past capacity before buffering (upstream untouched)', async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (_req, res) => {
+    hits++;
+    await new Promise(r => setTimeout(r, 200));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0); // cap 1, queue depth 0 → capacity 1
+  measureAll(am);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+
+  const p1 = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' }).then(r => r.status);
+  await new Promise(r => setTimeout(r, 50)); // req1 takes the only capacity slot
+  const s2 = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' }).then(r => r.status);
+  assert.equal(s2, 429, 'over-capacity request must be rejected');
+  assert.equal(await p1, 200);
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(hits, 1, 'rejected request never reached upstream');
+
+  upstream.close();
+  proxy.close();
+});

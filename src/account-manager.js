@@ -234,7 +234,8 @@ export class AccountManager {
    * The caller MUST releaseAccount(account.index) exactly once when the request
    * (including any streamed body) finishes.
    */
-  async acquireAccount(exclude = null, timeoutMs = 0) {
+  async acquireAccount(exclude = null, timeoutMs = 0, signal = null) {
+    if (signal?.aborted) return null;
     const account = this._tryAcquire(exclude);
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
@@ -242,7 +243,7 @@ export class AccountManager {
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
     if (timeoutMs <= 0 || !this.anyCapped(exclude) || this.isQueueFull()) return null;
-    return this._enqueue(exclude, timeoutMs);
+    return this._enqueue(exclude, timeoutMs, signal);
   }
 
   /** Is the overflow queue at its depth cap? */
@@ -250,18 +251,35 @@ export class AccountManager {
     return this._waiters.length >= this.maxQueueDepth;
   }
 
-  _enqueue(exclude, timeoutMs) {
+  /** Upper bound on useful concurrent requests: sum of caps + the queue depth. */
+  totalCapacity() {
+    return this.accounts.reduce((sum, a) => sum + a.maxConcurrent, 0) + this.maxQueueDepth;
+  }
+
+  _enqueue(exclude, timeoutMs, signal = null) {
     return new Promise(resolve => {
-      const waiter = { exclude, resolve, done: false, timer: null };
-      waiter.timer = setTimeout(() => {
-        if (waiter.done) return;
-        waiter.done = true;
-        const i = this._waiters.indexOf(waiter);
-        if (i >= 0) this._waiters.splice(i, 1);
-        resolve(null);
-      }, timeoutMs);
+      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null };
+      waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
+      // Cancel the wait if the client disconnects — otherwise an aborted request
+      // would still acquire a slot later and be dispatched upstream, burning quota.
+      if (signal) {
+        waiter.onAbort = () => this._settleWaiter(waiter, null);
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
       this._waiters.push(waiter);
     });
+  }
+
+  /** Resolve a queued waiter exactly once, cleaning up its timer/abort listener. */
+  _settleWaiter(waiter, value) {
+    if (waiter.done) return false;
+    waiter.done = true;
+    clearTimeout(waiter.timer);
+    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort);
+    const i = this._waiters.indexOf(waiter);
+    if (i >= 0) this._waiters.splice(i, 1);
+    waiter.resolve(value);
+    return true;
   }
 
   /**
@@ -280,14 +298,11 @@ export class AccountManager {
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
       const account = this._tryAcquire(waiter.exclude);
-      if (account) {
-        waiter.done = true;
-        clearTimeout(waiter.timer);
-        this._waiters.splice(i, 1);
-        waiter.resolve(account);
-      } else {
-        i++;
-      }
+      if (!account) { i++; continue; }
+      // _settleWaiter splices the waiter out, so don't advance i. If it was
+      // already settled (shouldn't happen — settled waiters aren't in the list),
+      // give the slot back instead of leaking it.
+      if (!this._settleWaiter(waiter, account)) { account.inflight--; i++; }
     }
   }
 

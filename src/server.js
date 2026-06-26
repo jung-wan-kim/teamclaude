@@ -24,6 +24,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
   let requestCounter = 0;
+  let inFlightProxied = 0; // proxied (non-status/oauth) requests currently being handled
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -55,7 +56,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream);
+        await relayRaw(req, res, upstream, maxBodyBytes);
         return;
       }
 
@@ -63,46 +64,61 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const reqId = ++requestCounter;
       hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
-      // Fast-reject when the fleet has no free slot AND the overflow queue is full,
-      // before buffering a body we'd only drop. Bounds backlog memory under a flood
-      // (localhost auth is skipped, so any local process could otherwise pile on).
-      // The per-account cap + bounded queue in acquireAccount are the authoritative
-      // limits; this is the cheap early-out.
-      if (!accountManager.anyUsable() && accountManager.isQueueFull()) {
+      // Global admission control: cap total in-flight proxied requests at the
+      // fleet's useful capacity (sum of per-account caps + overflow queue depth),
+      // and reject BEFORE buffering the body. Without this, body buffering happens
+      // before queue admission, so N concurrent uploads each buffer up to
+      // maxBodyBytes regardless of queue depth — memory grows with connection
+      // count (localhost auth is skipped, so any local process could flood). The
+      // bound here is admissionCap × maxBodyBytes.
+      if (inFlightProxied >= accountManager.totalCapacity()) {
         req.resume(); // drain & discard the body so the socket isn't leaked
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'rate_limit_error', message: 'Proxy overloaded; retry shortly.' },
+          error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
         }));
         return;
       }
+      inFlightProxied++;
 
-      // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
-      const bodyChunks = [];
-      let bodyLen = 0;
-      let bodyTooLarge = false;
-      for await (const chunk of req) {
-        bodyLen += chunk.length;
-        if (bodyLen > maxBodyBytes) { bodyTooLarge = true; break; }
-        bodyChunks.push(chunk);
-      }
-      if (bodyTooLarge) {
-        req.destroy();
-        if (!res.headersSent) {
-          res.writeHead(413, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` },
-          }));
-        }
-        return;
-      }
-      const body = Buffer.concat(bodyChunks);
-
-      const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs };
+      const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs, abortSignal: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
+        const bodyChunks = [];
+        let bodyLen = 0;
+        let bodyTooLarge = false;
+        for await (const chunk of req) {
+          bodyLen += chunk.length;
+          if (bodyLen > maxBodyBytes) { bodyTooLarge = true; break; }
+          bodyChunks.push(chunk);
+        }
+        if (bodyTooLarge) {
+          req.destroy();
+          if (!res.headersSent) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` },
+            }));
+          }
+          return; // finally below still decrements inFlightProxied
+        }
+        const body = Buffer.concat(bodyChunks);
+
+        // Tie an abort signal to client disconnect so a request that's only
+        // WAITING in the overflow queue is cancelled if the client goes away —
+        // otherwise it would acquire a slot later and be dispatched upstream,
+        // burning quota for a response nobody is listening for.
+        const ac = new AbortController();
+        const onClose = () => ac.abort();
+        res.on('close', onClose);
+        ctx.abortSignal = ac.signal;
+        try {
+          await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        } finally {
+          res.removeListener('close', onClose);
+        }
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -114,6 +130,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           }));
         }
       } finally {
+        inFlightProxied--;
         // Release the concurrency slot held by this request (if any). A failover
         // releases the previous account before re-acquiring, so at this point only
         // the last-held slot remains; releaseAccount guards against double-release.
@@ -136,10 +153,26 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
+ * Buffers the body bounded by maxBodyBytes (else 413) so the untouched
+ * `/v1/oauth/token` path can't be used to exhaust proxy memory.
  */
-async function relayRaw(req, res, upstream) {
+async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
   const bodyChunks = [];
-  for await (const chunk of req) bodyChunks.push(chunk);
+  let bodyLen = 0;
+  let tooLarge = false;
+  for await (const chunk of req) {
+    bodyLen += chunk.length;
+    if (bodyLen > maxBodyBytes) { tooLarge = true; break; }
+    bodyChunks.push(chunk);
+  }
+  if (tooLarge) {
+    req.destroy();
+    if (!res.headersSent) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` } }));
+    }
+    return;
+  }
   const body = Buffer.concat(bodyChunks);
 
   try {
@@ -232,7 +265,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (ctx.heldIndex != null) {
     account = accountManager.accounts[ctx.heldIndex];
   } else {
-    account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs);
+    account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal);
     if (account) ctx.heldIndex = account.index;
   }
   const releaseHeld = () => {
@@ -241,6 +274,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       ctx.heldIndex = null;
     }
   };
+
+  // The client disconnected while this request was queued (acquireAccount was
+  // cancelled by the abort signal) — nothing to respond to.
+  if (!account && (ctx.abortSignal?.aborted || res.destroyed)) return;
 
   if (!account) {
     ctx.account = '(none available)';
