@@ -331,6 +331,30 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account);
+
+  // The account may have been REMOVED (TUI/CLI delete) during the awaited refresh
+  // above (or the 401 forced-refresh that recurses back here). A detached account
+  // must not be used to dispatch upstream — its slot release is a no-op and we'd
+  // be sending traffic on a credential the operator just retired. Re-select a live
+  // account instead. (accounts[i] === account holds only while it's still live.)
+  if (accountManager.accounts[account.index] !== account) {
+    releaseHeld();
+    if (res.destroyed) return; // client gone — outer finally cleans up
+    if (retryCount < maxRetries) {
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    }
+    // Out of retry budget after repeated removals — respond rather than hang.
+    ctx.status = 503;
+    if (!res.headersSent) {
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '5' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'Account removed mid-request; retry shortly.' },
+      }));
+    }
+    return;
+  }
+
   if (account.status === 'error' && retryCount < maxRetries) {
     releaseHeld(); // failing over to a different account
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);

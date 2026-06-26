@@ -486,6 +486,37 @@ test('a keep-alive connection pins its sequential requests to one account (affin
   proxy.close();
 });
 
+test('an account removed just before dispatch is not used; the request re-selects a live account', async () => {
+  const served = []; // Bearer token actually sent upstream, per request
+  const upstream = http.createServer((req, res) => {
+    served.push((req.headers['authorization'] || '').replace('Bearer ', ''));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am); // first request deterministically routes to account 0 (tok-0)
+
+  // Delete the routed account synchronously, in the tiny window after selection
+  // and before dispatch (onRequestRouted fires right before ensureTokenFresh).
+  let removedOnce = false;
+  const hooks = {
+    onRequestRouted: () => { if (!removedOnce) { removedOnce = true; am.removeAccount(0); } },
+  };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` }, hooks);
+  const port = await listen(proxy);
+
+  const status = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' }).then(r => r.status);
+  assert.equal(status, 200, 'served successfully by a surviving account');
+  assert.ok(!served.includes('tok-0'),
+    `must not dispatch on the just-removed account; served=${served.join(',')}`);
+  assert.equal(am.accounts.every(a => a.inflight === 0), true, 'no leaked slot after the reselect');
+
+  upstream.close();
+  proxy.close();
+});
+
 test('a queued request cancelled by client disconnect never reaches upstream', async () => {
   let hits = 0;
   const upstream = http.createServer(async (_req, res) => {
