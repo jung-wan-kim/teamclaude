@@ -221,6 +221,31 @@ test('affinity holds a connection on its account when the sticky primary moves t
   assert.equal(again.index, first.index, 'affinity shields the existing connection from the primary move');
 });
 
+test('affinity defers to cold-start warm-up so every account still gets measured', async () => {
+  // Accounts start UNMEASURED. Even all on one connection (same affinity key),
+  // warm-up must still round-robin so each account gets measured — affinity
+  // must not pin everything to the first-measured account.
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const key = {};
+  const seen = new Set();
+  for (let i = 0; i < 4; i++) {
+    const a = await am.acquireAccount(null, 0, null, key);
+    seen.add(a.index);
+    am.releaseAccount(a.index);
+  }
+  assert.ok(seen.size >= 2, 'warm-up must reach both accounts despite affinity');
+});
+
+test('a non-object affinity key is ignored, not thrown on', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  measureAll(am);
+  // A primitive key would throw `Invalid value used as weak map key` if it
+  // reached WeakMap.get/set — it must be ignored and acquire normally instead.
+  const a = await am.acquireAccount(null, 0, null, 'session-1');
+  assert.ok(a, 'string key must not crash acquire');
+  am.releaseAccount(a.index);
+});
+
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
 test('proxy caps concurrent in-flight per account and still serves every request', async () => {

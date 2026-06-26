@@ -214,15 +214,22 @@ export class AccountManager {
    * the account and the inflight++ that reserves its slot.
    */
   _tryAcquire(exclude = null, affinityKey = null) {
-    // Connection affinity (cache locality): if this client connection already
-    // used an account, prefer it — but only as a *soft* hint. Honor it only when
-    // that account is still available, has a free slot, and isn't excluded for
-    // this request; otherwise fall through to normal selection. This never
-    // exceeds the per-account cap or revives an exhausted account, so the 429
-    // guarantees and use-or-lose routing for *new* connections are untouched.
-    // (The identity check `accounts[idx] === a` rejects a stale entry left by a
-    // removeAccount that re-indexed the array.)
-    if (affinityKey) {
+    // Only an object/function is a valid WeakMap key. Ignore anything else (a
+    // primitive key from an external caller would otherwise throw on get/set).
+    const affOk = affinityKey != null
+      && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
+
+    // Connection affinity (cache locality): prefer the account this connection
+    // already used — but only as a *soft* hint, and DEFER to cold-start warm-up.
+    // While any account still needs measuring, skip affinity so it can't pin all
+    // of a connection's traffic to one account and starve the others of quota
+    // data (warm-up round-robins the unmeasured accounts instead). Once measured,
+    // affinity is honored only when that account is still available, has a free
+    // slot, and isn't excluded for this request; otherwise it falls through to
+    // normal selection. So it never exceeds a cap, revives an exhausted account,
+    // or disturbs use-or-lose for new connections. (`accounts[idx] === a` rejects
+    // a stale entry left by a removeAccount that re-indexed the array.)
+    if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc))) {
       const a = this._affinity.get(affinityKey);
       if (a && this.accounts[a.index] === a && this._isAvailable(a)
           && this._hasCapacity(a) && !(exclude && exclude.has(a.index))) {
@@ -242,7 +249,7 @@ export class AccountManager {
     if (account && this._isAvailable(account) && this._hasCapacity(account)
         && !(eff && eff.has(account.index))) {
       account.inflight++;
-      if (affinityKey) this._affinity.set(affinityKey, account); // remember for this connection
+      if (affOk) this._affinity.set(affinityKey, account); // remember for this connection
       return account;
     }
     return null;
