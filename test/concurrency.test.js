@@ -246,6 +246,24 @@ test('a non-object affinity key is ignored, not thrown on', async () => {
   am.releaseAccount(a.index);
 });
 
+test('a transient cap spill does not rewrite a connection\'s affinity', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 1); // cap 1/account
+  measureAll(am);
+  const key = {};
+
+  const home = await am.acquireAccount(null, 0, null, key); // account X, fills its only slot
+  // Same key while the home is in-flight (capped) → must spill to another
+  // account, but must NOT adopt that spill as the connection's new home.
+  const spill = await am.acquireAccount(null, 0, null, key);
+  assert.notEqual(spill.index, home.index, 'spills off the momentarily-capped home');
+  am.releaseAccount(home.index);
+  am.releaseAccount(spill.index);
+
+  // Next sequential request returns to the original (now uncapped) home.
+  const next = await am.acquireAccount(null, 0, null, key);
+  assert.equal(next.index, home.index, 'affinity returns to the home account after a transient cap spill');
+});
+
 test('a transient per-request failover does not rewrite a connection\'s affinity', async () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
   measureAll(am);

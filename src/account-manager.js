@@ -238,17 +238,8 @@ export class AccountManager {
       }
     }
 
-    // A non-empty `exclude` means this is a per-request FAILOVER retry (the
-    // caller's first-choice account 429'd / 5xx'd for THIS request). The account
-    // picked here is a temporary fallback, not the connection's home — recording
-    // it as affinity would let one transient blip permanently evict the
-    // connection from its cache-warm account. So only (re)write affinity on a
-    // fresh, non-failover selection; a genuinely exhausted home is replaced
-    // naturally because the next *normal* selection won't pick it.
-    const isFailover = !!(exclude && exclude.size);
-
     const capped = this._cappedSet(exclude);
-    const eff = (isFailover || capped.size)
+    const eff = ((exclude && exclude.size) || capped.size)
       ? new Set([...(exclude || []), ...capped])
       : null;
     // eff === null → full sticky / warm-up path (cold start, nothing capped).
@@ -258,7 +249,19 @@ export class AccountManager {
     if (account && this._isAvailable(account) && this._hasCapacity(account)
         && !(eff && eff.has(account.index))) {
       account.inflight++;
-      if (affOk && !isFailover) this._affinity.set(affinityKey, account); // home only, not a failover target
+      // (Re)write affinity ONLY when the connection has no still-usable home.
+      // Reaching this fall-through path means we left the home account — but that
+      // can be merely transient: the home may be momentarily capped (overflow
+      // spill) or failover-excluded for THIS request, yet still perfectly
+      // available. Overwriting it then would let one blip permanently evict the
+      // connection from its cache-warm account. So keep an available home (even
+      // capped/excluded right now); replace it only when it's genuinely gone
+      // (removed, unavailable, or exhausted — `_isAvailable` is false).
+      if (affOk) {
+        const home = this._affinity.get(affinityKey);
+        const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home);
+        if (!homeUsable) this._affinity.set(affinityKey, account);
+      }
       return account;
     }
     return null;
