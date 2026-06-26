@@ -43,10 +43,12 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
   const deadline = AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (deadline.aborted) break; // total budget spent — don't start another attempt
     try {
       if (attempt > 0) {
-        const delay = baseDelayMs * 2 ** (attempt - 1);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        // Deadline-aware retry backoff: don't sleep past the total refresh budget.
+        await delayUntilAborted(baseDelayMs * 2 ** (attempt - 1), deadline);
+        if (deadline.aborted) break;
       }
 
       const res = await fetch(endpoint, {
@@ -94,6 +96,19 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       throw err;
     }
   }
+  // Reached only by breaking out when the shared deadline expired.
+  throw new Error(`Token refresh timed out after ${TOKEN_REFRESH_TIMEOUT_MS}ms`);
+}
+
+/** Sleep `ms`, but resolve early if `signal` aborts (cleans up its timer/listener). */
+function delayUntilAborted(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const cleanup = () => { clearTimeout(t); signal.removeEventListener('abort', onAbort); };
+    const onAbort = () => { cleanup(); resolve(); };
+    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /**
