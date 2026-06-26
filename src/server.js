@@ -330,7 +330,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
-  await accountManager.ensureTokenFresh(account.index);
+  await accountManager.ensureTokenFresh(account);
   if (account.status === 'error' && retryCount < maxRetries) {
     releaseHeld(); // failing over to a different account
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -396,7 +396,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         rateLimitHeaders[key] = value;
       }
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders);
+    accountManager.updateQuota(account, rateLimitHeaders);
 
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
@@ -413,7 +413,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           && retryCount < maxRetries && !res.destroyed) {
         ctx.authRetried.add(account);
         console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
-        await accountManager.ensureTokenFresh(account.index, true);
+        await accountManager.ensureTokenFresh(account, true);
         // ensureTokenFresh only marks 'error' for an expired token; a successful
         // (or non-fatal) refresh leaves status intact → retry the same account.
         if (account.status !== 'error') {
@@ -467,14 +467,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
-      if (accountManager.isExhausted(account.index)) {
+      if (accountManager.isExhausted(account)) {
         // (a) Account-level exhaustion: throttle this account (so
         // getActiveAccount skips it until it resets) and immediately
         // re-dispatch to another available account — never sleep holding the
         // client. When every account is throttled, getActiveAccount returns
         // null and the client gets a 429 to back off on its own.
         console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
-        accountManager.markRateLimited(account.index, retryAfter);
+        accountManager.markRateLimited(account, retryAfter);
         if (logDir) {
           logSections.push(`=== RESPONSE 429 — account quota exhausted, throttled ${retryAfter}s, switching ===\n${formatHeaders(upstreamRes.headers)}`);
           writeRequestLog(logDir, reqId, logSections);
@@ -636,14 +636,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
+      await streamResponse(upstreamRes.body, res, account, accountManager, streamLog);
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account, accountManager);
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
@@ -693,7 +693,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, account, accountManager, streamLog) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -720,7 +720,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, account, accountManager);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -736,7 +736,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, account, accountManager);
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
@@ -745,27 +745,27 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, account, accountManager) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(account, data.message.usage.input_tokens, 0);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      accountManager.updateUsage(account, 0, data.usage.output_tokens);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, account, accountManager) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(account, json.usage.input_tokens, json.usage.output_tokens);
     }
   } catch {
     // not JSON or no usage

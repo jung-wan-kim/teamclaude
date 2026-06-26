@@ -181,6 +181,16 @@ export class AccountManager {
   }
 
   /**
+   * Resolve an account handle to the live account object. Accepts the object
+   * itself (reindex-safe — what server.js passes) or a numeric index (legacy /
+   * tests). All public per-account methods route their first arg through this so
+   * a stale index captured before a removeAccount() can't hit the wrong account.
+   */
+  _resolve(accountOrIndex) {
+    return typeof accountOrIndex === 'number' ? this.accounts[accountOrIndex] : accountOrIndex;
+  }
+
+  /**
    * Available accounts currently at their concurrency cap, as a Set of account
    * OBJECTS (not indexes). Object identity is stable across a removeAccount()
    * re-index, so an exclude/capped set captured before the request awaits
@@ -346,13 +356,11 @@ export class AccountManager {
    * head-of-line blocking a later waiter that can run).
    */
   releaseAccount(accountOrIndex) {
-    // Accept the account OBJECT (what the server holds — reindex-safe across a
-    // removeAccount) or, for convenience/tests, a numeric index. Resolving to the
-    // object means a release decrements the slot of the *account that was
-    // acquired*, never whatever happens to sit at that index now.
-    const account = typeof accountOrIndex === 'number'
-      ? this.accounts[accountOrIndex]
-      : accountOrIndex;
+    // Resolve to the account OBJECT (what the server holds — reindex-safe across a
+    // removeAccount) so a release decrements the slot of the *account that was
+    // acquired*, never whatever happens to sit at that index now. A numeric index
+    // is still accepted for convenience/tests.
+    const account = this._resolve(accountOrIndex);
     if (account && account.inflight > 0) account.inflight--;
     this._drainWaiters();
   }
@@ -568,7 +576,7 @@ export class AccountManager {
    * Update an account's quota tracking from upstream response headers.
    */
   updateQuota(accountIndex, headers) {
-    const account = this.accounts[accountIndex];
+    const account = this._resolve(accountIndex);
     if (!account) return;
 
     // Unified rate limits (Claude Max)
@@ -619,7 +627,7 @@ export class AccountManager {
    * Update cumulative token usage from response body data.
    */
   updateUsage(accountIndex, inputTokens, outputTokens) {
-    const account = this.accounts[accountIndex];
+    const account = this._resolve(accountIndex);
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
@@ -639,7 +647,7 @@ export class AccountManager {
    * into the account's quota state.
    */
   isExhausted(accountIndex) {
-    const account = this.accounts[accountIndex];
+    const account = this._resolve(accountIndex);
     if (!account) return false;
     // Claude Max: upstream explicitly rejects when over the unified limit.
     if (account.quota.unifiedStatus === 'rejected') return true;
@@ -651,7 +659,7 @@ export class AccountManager {
    * Mark an account as rate-limited for a given duration.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
-    const account = this.accounts[accountIndex];
+    const account = this._resolve(accountIndex);
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
@@ -664,7 +672,7 @@ export class AccountManager {
    * Concurrent calls for the same account coalesce into a single refresh.
    */
   async ensureTokenFresh(accountIndex, force = false) {
-    const account = this.accounts[accountIndex];
+    const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
@@ -680,7 +688,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
-        this._onTokenRefresh?.(accountIndex, newTokens);
+        this._onTokenRefresh?.(account.index, newTokens);
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
@@ -707,7 +715,7 @@ export class AccountManager {
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
   updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
-    const account = this.accounts[accountIndex];
+    const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
 
     account.credential = accessToken;
@@ -715,7 +723,7 @@ export class AccountManager {
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
-    this._onTokenRefresh?.(accountIndex, {
+    this._onTokenRefresh?.(account.index, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,

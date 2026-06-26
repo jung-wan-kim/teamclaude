@@ -360,6 +360,28 @@ test('a failover exclude set skips the right account after a re-index (object id
   assert.notEqual(picked, bad, 'the excluded account is still skipped after the re-index');
 });
 
+test('a late 429 for a removed in-flight account does not poison a surviving account', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am); // both at util 0.1
+  const A = am.accounts[0];
+  const B = am.accounts[1];
+
+  // A is mid-flight upstream when an admin removes it. A is spliced out, B shifts
+  // into index 0, and A's own `.index` is now stale (still 0 → points at B).
+  am.removeAccount(A.index);
+
+  // The server applies A's late upstream 429 / quota by the account OBJECT A, so
+  // it must hit (the now-detached) A, never B.
+  am.markRateLimited(A, 60);
+  assert.equal(B.status, 'active', "survivor B must NOT be throttled by A's 429");
+  am.updateQuota(A, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.99',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+  assert.equal(B.quota.unified5h, 0.1, 'survivor B quota untouched by A response');
+  assert.equal(am.isExhausted(A), true, 'isExhausted targets A (its own quota), object-resolved');
+});
+
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
 test('proxy caps concurrent in-flight per account and still serves every request', async () => {
