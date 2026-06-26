@@ -236,6 +236,26 @@ test('affinity defers to cold-start warm-up so every account still gets measured
   assert.ok(seen.size >= 2, 'warm-up must reach both accounts despite affinity');
 });
 
+test('affinity does not pin to an unmeasured (headerless) account after warm-up tries are exhausted', async () => {
+  // Accounts that never return rate-limit headers stay unmeasured. After their
+  // warm-up tries (3 each) are spent, traffic on one affinity key must keep
+  // round-robining (the unmeasured rebalance) rather than pinning to one
+  // unmeasured account — otherwise the others never get measured / refreshed.
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const key = {};
+  const picks = [];
+  for (let i = 0; i < 10; i++) {
+    const a = await am.acquireAccount(null, 0, null, key); // no updateQuota → stays unmeasured
+    picks.push(a.index);
+    am.releaseAccount(a.index);
+  }
+  // 2 accounts × 3 warm-up tries = first 6 picks are warm-up; the tail is where a
+  // buggy affinity would pin to one unmeasured account.
+  const tail = picks.slice(6);
+  assert.ok(new Set(tail).size >= 2,
+    `must keep spreading across unmeasured accounts after warm-up, tail=${tail.join(',')}`);
+});
+
 test('a non-object affinity key is ignored, not thrown on', async () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
   measureAll(am);

@@ -231,7 +231,13 @@ export class AccountManager {
     // a stale entry left by a removeAccount that re-indexed the array.)
     if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc))) {
       const a = this._affinity.get(affinityKey);
-      if (a && this.accounts[a.index] === a && this._isAvailable(a)
+      // Require the home to be MEASURED — not just past its warm-up tries. A
+      // headerless account stays unmeasured forever; pinning a connection to it
+      // would bypass getActiveAccount's unmeasured-rebalance (which keeps
+      // spreading to gather quota data / let tokens refresh on use). Once an
+      // account returns rate-limit headers (every real Anthropic response does),
+      // affinity engages normally.
+      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a)
           && this._hasCapacity(a) && !(exclude && exclude.has(a.index))) {
         a.inflight++;
         return a;
