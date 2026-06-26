@@ -26,8 +26,9 @@ export async function importCredentials(filePath) {
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-// Bound each token-refresh attempt so a hung token endpoint can't block the
-// refresh (and every request coalesced onto it / holding an account slot) forever.
+// Bound the WHOLE token refresh (all retry attempts combined) so a hung token
+// endpoint can't block the refresh — and every request coalesced onto it /
+// holding an account slot — for long. One shared deadline, not per attempt.
 const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
@@ -37,6 +38,9 @@ const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
   const maxRetries = 2;
   const baseDelayMs = 500;
+  // One deadline for the entire refresh (shared by every attempt), so the whole
+  // operation is bounded by TOKEN_REFRESH_TIMEOUT_MS rather than that × attempts.
+  const deadline = AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -57,7 +61,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
-        signal: AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
+        signal: deadline,
       });
 
       if (!res.ok) {
@@ -82,7 +86,9 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
            err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
 
-      if (attempt < maxRetries && isNetworkError) {
+      // Stop retrying once the shared refresh deadline is spent — otherwise the
+      // retry delays would push the total past the intended bound.
+      if (attempt < maxRetries && isNetworkError && !deadline.aborted) {
         continue;
       }
       throw err;
