@@ -246,7 +246,18 @@ function formatHeaders(headers) {
 // forwardRequest fails them over to another account and, when the whole fleet is
 // overloaded, retries with a bounded exponential backoff before giving up.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Sleep that also resolves immediately if `signal` aborts — so a client that
+// disconnects during an overload backoff doesn't keep its account slot reserved
+// for the whole (up to multi-second) wait. Cleans up its timer/listener either way.
+function sleepOrAbort(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const cleanup = () => { clearTimeout(t); signal?.removeEventListener('abort', onAbort); };
+    const onAbort = () => { cleanup(); resolve(); };
+    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 // parseInt with a default that HONORS an explicit 0 — unlike `parseInt(...) || def`,
 // which discards a valid 0 (0 is falsy). e.g. TEAMCLAUDE_OVERLOAD_RETRIES=0 must
@@ -611,8 +622,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
           writeRequestLog(logDir, reqId, logSections);
         }
-        await sleep(waitMs);
-        if (res.destroyed) return;
+        await sleepOrAbort(waitMs, ctx.abortSignal);
+        // Client gone during the backoff → bail; the outer finally releases the
+        // slot promptly instead of holding it for the rest of the wait.
+        if (res.destroyed || ctx.abortSignal?.aborted) return;
         ctx.tried5xx.clear(); // fresh round: let every account be tried again
         releaseHeld();        // re-acquire from the full set on the next round
         return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
