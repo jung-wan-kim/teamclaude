@@ -411,6 +411,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       headers,
       body: ['GET', 'HEAD'].includes(method) ? undefined : body,
       redirect: 'manual',
+      // Abort the upstream call when the client disconnects (ctx.abortSignal is
+      // tied to res 'close'). Without this, a client that drops mid-SSE while the
+      // upstream stalls would leave streamResponse blocked in reader.read(), so
+      // the per-account slot and inFlightProxied never release — repeated stalls
+      // would leak the proxy to capacity. Aborting rejects the read and unwinds
+      // the finally that frees the slot.
+      signal: ctx.abortSignal,
     });
 
     // Extract rate limit headers
@@ -679,6 +686,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       res.end(buf);
     }
   } catch (err) {
+    // Client disconnected → we aborted the upstream fetch (ctx.abortSignal). This
+    // is not the account's fault: don't mark it 'error' or fail over (the client
+    // is gone). Just unwind — the outer finally releases the slot / inFlightProxied.
+    if (ctx.abortSignal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || res.destroyed) {
+      if (!res.writableEnded) res.destroy();
+      return;
+    }
+
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
 
     if (logDir) {

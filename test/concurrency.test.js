@@ -574,6 +574,40 @@ test('a queued request cancelled by client disconnect never reaches upstream', a
   proxy.close();
 });
 
+test('a client disconnect during a stalled SSE stream releases the slot (no capacity leak)', async () => {
+  // Upstream opens an SSE stream, sends one event, then STALLS forever (never ends).
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"ping"}\n\n');
+    // intentionally never res.end()
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1); // cap 1 — leak shows immediately
+  measureAll(am);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+
+  const ac = new AbortController();
+  const p = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}', signal: ac.signal })
+    .catch(() => 'aborted');
+  await new Promise(r => setTimeout(r, 80)); // stream started → slot reserved
+  assert.equal(am.accounts[0].inflight, 1, 'slot held while streaming');
+
+  ac.abort(); // client drops mid-stream while upstream is stalled
+  await p;
+  await new Promise(r => setTimeout(r, 150)); // let the abort unwind reader.read() + release
+
+  assert.equal(am.accounts[0].inflight, 0, 'slot released after client disconnect — no capacity leak');
+  // capacity is reusable immediately
+  const a = await am.acquireAccount(null, 0, null, null);
+  assert.ok(a, 'capacity recovered after the stalled-stream disconnect');
+  am.releaseAccount(a);
+
+  upstream.close();
+  proxy.close();
+});
+
 test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
