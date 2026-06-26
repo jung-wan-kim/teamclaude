@@ -290,6 +290,46 @@ test('proxy caps concurrent in-flight per account and still serves every request
   proxy.close();
 });
 
+test('a keep-alive connection pins its sequential requests to one account (affinity end-to-end)', async () => {
+  const served = []; // token (account) that handled each request, in order
+  const upstream = http.createServer((req, res) => {
+    served.push((req.headers['authorization'] || '').replace('Bearer ', ''));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  // reeval ON (1ms): the global sticky primary may move between turns, but a
+  // live connection's affinity must hold it on one account (the #4 mitigation).
+  const am = new AccountManager(makeAccounts(3), 0.98, 1, 3);
+  measureAll(am);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+
+  // One socket, reused for sequential (awaited) requests — the keep-alive case.
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const call = () => new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port, path: '/v1/messages', method: 'POST', agent }, res => {
+      res.resume(); res.on('end', resolve); res.on('error', reject);
+    });
+    r.on('error', reject);
+    r.end('{}');
+  });
+
+  await call();
+  await new Promise(r => setTimeout(r, 5)); // let the reeval interval elapse between turns
+  await call();
+  await call();
+  agent.destroy();
+
+  assert.equal(served.length, 3);
+  assert.ok(served.every(t => t === served[0]),
+    'all turns on the keep-alive socket hit one account despite reeval re-prioritization');
+
+  upstream.close();
+  proxy.close();
+});
+
 test('a queued request cancelled by client disconnect never reaches upstream', async () => {
   let hits = 0;
   const upstream = http.createServer(async (_req, res) => {
