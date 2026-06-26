@@ -246,6 +246,27 @@ test('a non-object affinity key is ignored, not thrown on', async () => {
   am.releaseAccount(a.index);
 });
 
+test('a transient per-request failover does not rewrite a connection\'s affinity', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  measureAll(am);
+  const key = {};
+
+  const first = await am.acquireAccount(null, 0, null, key);
+  const home = first.index;
+  am.releaseAccount(home);
+
+  // Simulate THIS request failing over off `home` (per-request exclude, as a
+  // transient 429/5xx does). The retry must pick a different account but must
+  // NOT adopt it as the connection's new home.
+  const fb = await am.acquireAccount(new Set([home]), 0, null, key);
+  assert.notEqual(fb.index, home, 'failover picks a different account');
+  am.releaseAccount(fb.index);
+
+  // The next normal request on the same connection returns to its warm home.
+  const next = await am.acquireAccount(null, 0, null, key);
+  assert.equal(next.index, home, 'affinity stays on the home account after a transient failover');
+});
+
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
 test('proxy caps concurrent in-flight per account and still serves every request', async () => {

@@ -238,8 +238,17 @@ export class AccountManager {
       }
     }
 
+    // A non-empty `exclude` means this is a per-request FAILOVER retry (the
+    // caller's first-choice account 429'd / 5xx'd for THIS request). The account
+    // picked here is a temporary fallback, not the connection's home — recording
+    // it as affinity would let one transient blip permanently evict the
+    // connection from its cache-warm account. So only (re)write affinity on a
+    // fresh, non-failover selection; a genuinely exhausted home is replaced
+    // naturally because the next *normal* selection won't pick it.
+    const isFailover = !!(exclude && exclude.size);
+
     const capped = this._cappedSet(exclude);
-    const eff = ((exclude && exclude.size) || capped.size)
+    const eff = (isFailover || capped.size)
       ? new Set([...(exclude || []), ...capped])
       : null;
     // eff === null → full sticky / warm-up path (cold start, nothing capped).
@@ -249,7 +258,7 @@ export class AccountManager {
     if (account && this._isAvailable(account) && this._hasCapacity(account)
         && !(eff && eff.has(account.index))) {
       account.inflight++;
-      if (affOk) this._affinity.set(affinityKey, account); // remember for this connection
+      if (affOk && !isFailover) this._affinity.set(affinityKey, account); // home only, not a failover target
       return account;
     }
     return null;
