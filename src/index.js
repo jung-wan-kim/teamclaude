@@ -315,23 +315,30 @@ function lsofPid(port) {
  * or null when nothing is listening.
  */
 async function findRunningServer(config) {
-  const port = config?.proxy?.port;
-
-  if (!(await probeServer(port))) {
-    if (await readServerState()) await clearServerState(); // nothing here → drop stale state
-    return null;
-  }
-
-  const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
-  if (ownerPid) return { pid: ownerPid, port };
-
-  // lsof unavailable: fall back to the recorded pid only if it is alive AND was
-  // recorded for THIS port (so a stale pid for a different port can't be signaled).
+  const configPort = config?.proxy?.port;
   const state = await readServerState();
-  if (state?.pid && state.port === port && isPidAlive(state.pid)) {
-    return { pid: state.pid, port };
+
+  // Try the port the server ACTUALLY bound (recorded in the state file) first —
+  // it may differ from the current config port after the config was edited, and
+  // probing only the config port would miss (and then orphan) the live server.
+  const candidates = [];
+  if (state?.port) candidates.push(state.port);
+  if (configPort && configPort !== state?.port) candidates.push(configPort);
+
+  for (const port of candidates) {
+    if (!(await probeServer(port))) continue;
+    const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
+    if (ownerPid) return { pid: ownerPid, port };
+    // lsof unavailable: trust the recorded pid only if alive AND recorded for THIS port.
+    if (state?.pid && state.port === port && isPidAlive(state.pid)) return { pid: state.pid, port };
+    return { pid: null, port };
   }
-  return { pid: null, port };
+
+  // Nothing TeamClaude-shaped answers on any candidate port. Only drop the state
+  // file if its recorded pid is also gone — don't delete the discovery record for
+  // a server that's merely unreachable for a moment.
+  if (state && !(state.pid && isPidAlive(state.pid))) await clearServerState();
+  return null;
 }
 
 /**
@@ -574,15 +581,23 @@ async function runCommand() {
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
-  const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
+  // Locate the actual running server (its bound port may differ from the current
+  // config port after an edit). findRunningServer handles stale-state cleanup; do
+  // NOT clear state here, or a momentary blip would orphan a live server.
+  const running = await findRunningServer(config);
+  if (!running) {
+    console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
+    console.log('Start it with:  teamclaude server');
+    process.exit(1);
+  }
+  const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
 
-    const state = await readServerState();
-    const pidStr = state?.pid && isPidAlive(state.pid) ? `pid ${state.pid}, ` : '';
-    console.log(`Server:         running (${pidStr}port ${config.proxy.port})`);
+    const pidStr = running.pid ? `pid ${running.pid}, ` : '';
+    console.log(`Server:         running (${pidStr}port ${running.port})`);
     console.log(`Active account: ${data.currentAccount}`);
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 
@@ -611,9 +626,9 @@ async function statusCommand() {
       console.log('');
     }
   } catch {
-    await clearServerState(); // not reachable → drop any stale recorded state
-    console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
-    console.log('Start it with:  teamclaude server');
+    // findRunningServer just confirmed a server answered; a failure here is a
+    // transient blip, not a reason to delete the discovery record.
+    console.log(`Server:         unreachable (port ${running.port}) — try again`);
     process.exit(1);
   }
 }

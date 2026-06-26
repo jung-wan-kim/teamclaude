@@ -52,25 +52,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // Let client token refresh requests pass through to upstream untouched.
-      // The proxy manages its own tokens via ensureTokenFresh(); intercepting
-      // or rewriting client refreshes would cause token rotation conflicts.
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream, maxBodyBytes);
-        return;
-      }
-
-      // Track request
-      const reqId = ++requestCounter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
-
-      // Global admission control: cap total in-flight proxied requests at the
-      // fleet's useful capacity (sum of per-account caps + overflow queue depth),
-      // and reject BEFORE buffering the body. Without this, body buffering happens
-      // before queue admission, so N concurrent uploads each buffer up to
-      // maxBodyBytes regardless of queue depth — memory grows with connection
-      // count (localhost auth is skipped, so any local process could flood). The
-      // bound here is admissionCap × maxBodyBytes.
+      // Everything below buffers a request body (the OAuth relay AND the proxied
+      // path) → global admission control to bound proxy memory: inFlightProxied
+      // may not exceed the fleet's useful capacity (sum of per-account caps +
+      // overflow queue depth), and we reject BEFORE buffering. Without this, body
+      // buffering happens before any queue admission, so N concurrent uploads each
+      // buffer up to maxBodyBytes regardless of queue depth — memory would grow
+      // with connection count (localhost auth is skipped, so any local process
+      // could flood, including via /v1/oauth/token). Bound: totalCapacity × maxBodyBytes.
       if (inFlightProxied >= accountManager.totalCapacity()) {
         req.resume(); // drain & discard the body so the socket isn't leaked
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
@@ -81,67 +70,81 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
       inFlightProxied++;
-
-      const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs, abortSignal: null };
       try {
-        // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
-        const bodyChunks = [];
-        let bodyLen = 0;
-        let bodyTooLarge = false;
-        for await (const chunk of req) {
-          bodyLen += chunk.length;
-          if (bodyLen > maxBodyBytes) { bodyTooLarge = true; break; }
-          bodyChunks.push(chunk);
+        // Let client token refresh requests pass through to upstream untouched.
+        // The proxy manages its own tokens via ensureTokenFresh(); intercepting
+        // or rewriting client refreshes would cause token rotation conflicts.
+        if (req.method === 'POST' && req.url === '/v1/oauth/token') {
+          await relayRaw(req, res, upstream, maxBodyBytes);
+          return; // outer finally decrements inFlightProxied
         }
-        if (bodyTooLarge) {
-          req.destroy();
+
+        // Track request
+        const reqId = ++requestCounter;
+        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+
+        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, heldIndex: null, queueTimeoutMs, abortSignal: null };
+        try {
+          // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
+          const bodyChunks = [];
+          let bodyLen = 0;
+          let bodyTooLarge = false;
+          for await (const chunk of req) {
+            bodyLen += chunk.length;
+            if (bodyLen > maxBodyBytes) { bodyTooLarge = true; break; }
+            bodyChunks.push(chunk);
+          }
+          if (bodyTooLarge) {
+            req.destroy();
+            if (!res.headersSent) {
+              res.writeHead(413, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                type: 'error',
+                error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` },
+              }));
+            }
+            return;
+          }
+          const body = Buffer.concat(bodyChunks);
+
+          // Tie an abort signal to client disconnect so a request that's only
+          // WAITING in the overflow queue is cancelled if the client goes away —
+          // otherwise it would acquire a slot later and be dispatched upstream,
+          // burning quota for a response nobody is listening for.
+          const ac = new AbortController();
+          const onClose = () => ac.abort();
+          res.on('close', onClose);
+          ctx.abortSignal = ac.signal;
+          try {
+            await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+          } finally {
+            res.removeListener('close', onClose);
+          }
+        } catch (err) {
+          ctx.status = ctx.status || 502;
+          console.error('[TeamClaude] Unhandled error:', err);
           if (!res.headersSent) {
-            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
               type: 'error',
-              error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` },
+              error: { type: 'proxy_error', message: 'Internal proxy error' },
             }));
           }
-          return; // finally below still decrements inFlightProxied
-        }
-        const body = Buffer.concat(bodyChunks);
-
-        // Tie an abort signal to client disconnect so a request that's only
-        // WAITING in the overflow queue is cancelled if the client goes away —
-        // otherwise it would acquire a slot later and be dispatched upstream,
-        // burning quota for a response nobody is listening for.
-        const ac = new AbortController();
-        const onClose = () => ac.abort();
-        res.on('close', onClose);
-        ctx.abortSignal = ac.signal;
-        try {
-          await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         } finally {
-          res.removeListener('close', onClose);
-        }
-      } catch (err) {
-        ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'proxy_error', message: 'Internal proxy error' },
-          }));
+          // Release the concurrency slot held by this request (if any). A failover
+          // releases the previous account before re-acquiring, so at this point only
+          // the last-held slot remains; releaseAccount guards against double-release.
+          if (ctx.heldIndex != null) {
+            accountManager.releaseAccount(ctx.heldIndex);
+            ctx.heldIndex = null;
+          }
+          hooks.onRequestEnd?.(reqId, {
+            method: req.method, path: req.url,
+            account: ctx.account, status: ctx.status,
+          });
         }
       } finally {
         inFlightProxied--;
-        // Release the concurrency slot held by this request (if any). A failover
-        // releases the previous account before re-acquiring, so at this point only
-        // the last-held slot remains; releaseAccount guards against double-release.
-        if (ctx.heldIndex != null) {
-          accountManager.releaseAccount(ctx.heldIndex);
-          ctx.heldIndex = null;
-        }
-        hooks.onRequestEnd?.(reqId, {
-          method: req.method, path: req.url,
-          account: ctx.account, status: ctx.status,
-        });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
