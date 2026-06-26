@@ -688,7 +688,11 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
-        this._onTokenRefresh?.(account.index, newTokens);
+        // Only persist if the account is still live at its claimed index. If it was
+        // removed during the (awaited) network refresh, its `.index` is stale and
+        // would misattribute the write to the survivor that shifted into that slot
+        // — and a deleted account's tokens don't need persisting anyway.
+        if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
@@ -723,7 +727,9 @@ export class AccountManager {
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
-    this._onTokenRefresh?.(account.index, {
+    // Same liveness guard as ensureTokenFresh: never emit a stale index for a
+    // removed account (here the path is synchronous, but keep the invariant uniform).
+    if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,

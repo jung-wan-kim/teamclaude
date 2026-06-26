@@ -382,6 +382,26 @@ test('a late 429 for a removed in-flight account does not poison a surviving acc
   assert.equal(am.isExhausted(A), true, 'isExhausted targets A (its own quota), object-resolved');
 });
 
+test('token-refresh callback is not emitted with a stale index for a removed account', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  const A = am.accounts[0];
+  let emitted = null;
+  am.onTokenRefresh((idx, tokens) => { emitted = { idx, tokens }; });
+
+  // Remove A; B shifts into index 0 while A keeps a stale .index === 0.
+  am.removeAccount(A.index);
+
+  // A late token update for the (now-removed) A must NOT fire the persist
+  // callback — otherwise its stale index 0 would write A's tokens into B's config.
+  am.updateAccountTokens(A, { accessToken: 'x', refreshToken: 'y', expiresAt: Date.now() + HOUR });
+  assert.equal(emitted, null, 'no callback for a removed account → no stale-index config write');
+
+  // Sanity: a live account still emits (with its current index).
+  const B = am.accounts[0];
+  am.updateAccountTokens(B, { accessToken: 'x2', refreshToken: 'y2', expiresAt: Date.now() + HOUR });
+  assert.ok(emitted && emitted.idx === 0, 'a live account still persists, with its current index');
+});
+
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
 test('proxy caps concurrent in-flight per account and still serves every request', async () => {
