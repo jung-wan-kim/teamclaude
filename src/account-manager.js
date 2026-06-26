@@ -756,6 +756,10 @@ export class AccountManager {
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
     });
+    // The new account has free capacity — hand it to any request waiting in the
+    // overflow queue instead of letting it time out to a 429 while a usable
+    // account sits idle.
+    this._drainWaiters();
     return index;
   }
 

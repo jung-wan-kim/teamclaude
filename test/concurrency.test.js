@@ -305,6 +305,25 @@ test('a transient per-request failover does not rewrite a connection\'s affinity
   assert.equal(next.index, home, 'affinity stays on the home account after a transient failover');
 });
 
+test('addAccount wakes a queued waiter the new capacity can serve', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1); // one account, cap 1
+  measureAll(am);
+  const held = await am.acquireAccount(null, 0, null, null); // fill the only slot
+
+  // request2 has nowhere to go → it queues (cap saturated, a slot *could* free).
+  let resolved = false;
+  const pending = am.acquireAccount(null, 1000).then(a => { resolved = true; return a; });
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal(resolved, false, 'request is queued while the only account is capped');
+
+  // A freshly added account has free capacity → it must wake the queued waiter
+  // immediately, not let it time out to a 429.
+  am.addAccount({ name: 'new', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR });
+  const a = await pending;
+  assert.ok(a, 'the queued request is served by the newly added account');
+  assert.notEqual(a, held, 'served by the new account, not the still-held one');
+});
+
 // ── unit: index handles survive a runtime removeAccount() ─────────────────
 
 test('releaseAccount by object frees the right slot after a concurrent removeAccount re-index', async () => {
