@@ -186,6 +186,12 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
   }
   const body = Buffer.concat(bodyChunks);
 
+  // Abort the relay if the client disconnects, so a hung upstream OAuth endpoint
+  // can't pin this connection (and its admission-control inFlightProxied slot)
+  // forever. Tied to res 'close'; the listener is removed once we're done.
+  const ac = new AbortController();
+  const onClose = () => ac.abort();
+  res.on('close', onClose);
   try {
     const upstreamRes = await fetch(`${upstream}${req.url}`, {
       method: req.method,
@@ -195,6 +201,7 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
         'user-agent': req.headers['user-agent'] || 'node',
       },
       body: body.length > 0 ? body : undefined,
+      signal: ac.signal,
     });
 
     const responseBody = await upstreamRes.text();
@@ -206,11 +213,18 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
+    // Client disconnected → we aborted the relay; nothing to respond to.
+    if (ac.signal.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || res.destroyed) {
+      if (!res.writableEnded) res.destroy();
+      return;
+    }
     console.error('[TeamClaude] Raw relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
     }
+  } finally {
+    res.removeListener('close', onClose);
   }
 }
 
@@ -256,6 +270,24 @@ function sleepOrAbort(ms, signal) {
     const onAbort = () => { cleanup(); resolve(); };
     const t = setTimeout(() => { cleanup(); resolve(); }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// Await `promise`, but stop waiting the instant `signal` aborts (client gone).
+// The underlying op (e.g. a coalesced token refresh shared by other requests)
+// is NOT cancelled — we only stop *this* request from blocking on it, so its
+// account slot can be released promptly. Rejections still propagate.
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const onAbort = () => { cleanup(); resolve(); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { cleanup(); resolve(v); },
+      (e) => { cleanup(); reject(e); },
+    );
   });
 }
 
@@ -340,8 +372,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
-  // Refresh OAuth token if needed
-  await accountManager.ensureTokenFresh(account);
+  // Refresh OAuth token if needed. Stop waiting if the client disconnects (the
+  // refresh is coalesced/shared, so we don't cancel it — we just don't pin this
+  // request's account slot on a possibly-hung token endpoint).
+  await raceAbort(accountManager.ensureTokenFresh(account), ctx.abortSignal);
+  if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone — outer finally frees the slot
 
   // The account may have been REMOVED (TUI/CLI delete) during the awaited refresh
   // above (or the 401 forced-refresh that recurses back here). A detached account
@@ -455,7 +490,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           && retryCount < maxRetries && !res.destroyed) {
         ctx.authRetried.add(account);
         console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
-        await accountManager.ensureTokenFresh(account, true);
+        await raceAbort(accountManager.ensureTokenFresh(account, true), ctx.abortSignal);
+        if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone during refresh
         // ensureTokenFresh only marks 'error' for an expired token; a successful
         // (or non-fatal) refresh leaves status intact → retry the same account.
         if (account.status !== 'error') {

@@ -26,6 +26,9 @@ export async function importCredentials(filePath) {
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+// Bound each token-refresh attempt so a hung token endpoint can't block the
+// refresh (and every request coalesced onto it / holding an account slot) forever.
+const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
@@ -54,6 +57,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
+        signal: AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
       });
 
       if (!res.ok) {
@@ -74,6 +78,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
     } catch (err) {
       const isNetworkError = err instanceof Error &&
         (err.message.includes('fetch failed') ||
+          err.name === 'TimeoutError' || err.name === 'AbortError' ||
           (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
            err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
 

@@ -668,6 +668,41 @@ test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
   proxy.close();
 });
 
+test('a client disconnect during a hung /v1/oauth/token relay frees admission capacity', async () => {
+  const upstream = http.createServer(() => { /* hang forever — never respond */ });
+  const upstreamPort = await listen(upstream);
+
+  // totalCapacity = caps(1) + queueDepth(0) = 1, so one in-flight relay saturates
+  // global admission — the leak (or its fix) is immediately observable.
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+
+  const ac1 = new AbortController();
+  const p1 = fetch(`http://127.0.0.1:${port}/v1/oauth/token`, { method: 'POST', body: '{}', signal: ac1.signal })
+    .catch(() => 'aborted');
+  await new Promise(r => setTimeout(r, 80)); // relay in flight → admission at capacity
+
+  ac1.abort(); // client drops while the upstream relay hangs
+  await p1;
+  await new Promise(r => setTimeout(r, 80)); // abort unwinds the relay → capacity should free
+
+  // A new relay must now be ADMITTED (not 429'd by a pinned inFlightProxied).
+  const ac2 = new AbortController();
+  let p2status = null;
+  const p2 = fetch(`http://127.0.0.1:${port}/v1/oauth/token`, { method: 'POST', body: '{}', signal: ac2.signal })
+    .then(r => { p2status = r.status; return r.status; })
+    .catch(() => 'aborted');
+  await new Promise(r => setTimeout(r, 80));
+  assert.notEqual(p2status, 429, 'capacity was freed by the aborted relay (new relay admitted, not rejected)');
+
+  ac2.abort();
+  await p2;
+  upstream.close();
+  proxy.close();
+});
+
 test('global admission cap rejects past capacity before buffering (upstream untouched)', async () => {
   let hits = 0;
   const upstream = http.createServer(async (_req, res) => {
