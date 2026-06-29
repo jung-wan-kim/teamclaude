@@ -436,12 +436,14 @@ export class AccountManager {
 
   /**
    * Explicit selection priority: lower = preferred. Unset (null) sorts last
-   * (MAX_SAFE_INTEGER) so accounts WITH a priority are chosen ahead of those
-   * without. When no account sets a priority, every account ties here and the
-   * sort falls through to use-or-lose — i.e. the original behavior unchanged.
+   * (Infinity) so an account WITH any finite priority — however large — is chosen
+   * ahead of those without. When no account sets a priority, every account ties
+   * here (Infinity === Infinity) and the sort falls through to use-or-lose, i.e.
+   * the original behavior unchanged. The callers compare with a `pa !== pb` guard
+   * before any subtraction, so Infinity never produces a NaN sort key.
    */
   _priority(account) {
-    return Number.isFinite(account.priority) ? account.priority : Number.MAX_SAFE_INTEGER;
+    return Number.isFinite(account.priority) ? account.priority : Infinity;
   }
 
   /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */

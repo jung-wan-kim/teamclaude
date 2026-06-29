@@ -967,3 +967,19 @@ test('totalCapacity excludes disabled accounts (tight admission bound)', () => {
   am.setEnabled('a1', true);
   assert.equal(am.totalCapacity(), 3 * 4 + 10, 're-enabled account counts again');
 });
+
+test('a very large explicit priority still outranks an unset account', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  am.setPriority('a0', 1e16);                  // larger than MAX_SAFE_INTEGER, but still finite/explicit
+  // a1 is unset → sentinel Infinity → a0 (explicit) must sort ahead of a1.
+  assert.equal(am._selectBest().name, 'a0', 'any finite explicit priority beats "no preference"');
+});
+
+test('all-unset priorities still tie (no NaN sort key) and fall through to use-or-lose', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  const now = Date.now();
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 2 * HOUR) / 1000)) });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 1 * HOUR) / 1000)) });
+  assert.equal(am._selectBest().name, 'a1', 'Infinity===Infinity ties → soonest reset wins, no NaN');
+});
