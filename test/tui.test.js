@@ -61,7 +61,18 @@ test('TUI priority input with empty value clears the priority', async () => {
   tui._promptPriority(0);
   await tui.inputCb('');                  // empty → clear
   assert.equal(am.accounts[0].priority, null, 'cleared in AccountManager');
-  assert.equal('priority' in config.accounts[0], false, 'priority removed from config');
+  // Persisted as explicit null (not a deleted key) so the shared saveConfig
+  // `{...diskAcct, ...live}` merge can't let a stale disk priority survive.
+  assert.equal(config.accounts[0].priority, null, 'config priority set to null');
+});
+
+test('a config priority of null loads as "unset" (use-or-lose), matching a cleared key', () => {
+  const am = new AccountManager([
+    { name: 'a0', type: 'apikey', apiKey: 'k', priority: null },
+    { name: 'a1', type: 'apikey', apiKey: 'k' },
+  ], 0.98, 0, 5);
+  assert.equal(am.accounts[0].priority, null, 'null priority loads as unset');
+  assert.equal(am._priority(am.accounts[0]), Infinity, 'unset sentinel — no preference');
 });
 
 test('TUI priority input rejects a non-numeric value (no change)', async () => {

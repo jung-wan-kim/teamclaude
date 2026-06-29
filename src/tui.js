@@ -432,9 +432,13 @@ export class TUI {
     this.am.setPriority(amAcct, value);
     // Persist onto the config entry matched by identity (UUID-first, then name) —
     // same reasoning as _doToggleEnabled (display index may not map onto config).
+    // Clearing writes `null` rather than deleting the key: saveConfig persists via
+    // `{...diskAcct, ...live}`, so a deleted key would let the stale disk priority
+    // survive the merge. An explicit null overrides it (and loads as "unset", since
+    // _priority treats any non-finite value as no preference).
     const cfg = (amAcct.accountUuid && this.config.accounts.find(a => a.accountUuid === amAcct.accountUuid))
       || this.config.accounts.find(a => a.name === amAcct.name);
-    if (cfg) { if (value === null) delete cfg.priority; else cfg.priority = value; }
+    if (cfg) cfg.priority = value; // value is null when clearing
     await this.saveConfig(this.config);
     this._addLog(value === null
       ? `Cleared priority for "${amAcct.name}"`
