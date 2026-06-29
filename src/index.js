@@ -132,24 +132,24 @@ async function serverCommand() {
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    if (config.accounts[idx]) {
-      config.accounts[idx].accessToken = newTokens.accessToken;
-      config.accounts[idx].refreshToken = newTokens.refreshToken;
-      config.accounts[idx].expiresAt = newTokens.expiresAt;
+    // Keep the in-memory config.accounts in sync so a TUI saveConfig doesn't
+    // clobber fresh tokens. Match by IDENTITY (UUID first, then name) — not by the
+    // AccountManager index `idx`, which can point at a different config entry when
+    // a tokenless config account was skipped at load.
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx >= 0) {
+      config.accounts[memIdx].accessToken = newTokens.accessToken;
+      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
+      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
     }
     atomicConfigUpdate(diskConfig => {
-      // Pick up any new accounts from disk so index matching stays correct
-      // (only add, don't refresh credentials — we're about to write the authoritative tokens)
-      for (const diskAcct of diskConfig.accounts) {
-        const known = (diskAcct.accountUuid && config.accounts.some(a => a.accountUuid === diskAcct.accountUuid))
-          || config.accounts.some(a => a.name === diskAcct.name);
-        if (!known) {
-          config.accounts.push(diskAcct);
-          accountManager.addAccount(diskAcct);
-        }
-      }
-      // Match by UUID first, then by name — index may have shifted
+      // Persist ONLY the refreshed account's tokens. We deliberately do NOT ingest
+      // disk-only accounts here: that loop existed to keep the old INDEX-based
+      // matching aligned, but matching is identity-based now (findConfigAccount),
+      // so it's unnecessary — and re-adding every disk account would resurrect one
+      // the TUI just deleted (whose save may not have committed yet). External
+      // account discovery stays in syncAccountsFromDisk (TUI R / restart).
+      // Match by UUID first, then by name — index may have shifted.
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
@@ -171,19 +171,32 @@ async function serverCommand() {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map((a, i) => {
-          const am = accountManager.accounts[i];
+        const mapped = config.accounts.map(a => {
+          // Match the live account by IDENTITY — never by array index:
+          // resolveAccounts() can skip a tokenless/bad config entry, so
+          // config.accounts and accountManager.accounts are not index-aligned, and
+          // an index map would overlay the wrong account's credentials. Two-phase
+          // (UUID first, then name): a single `uuid===x || name===x` find could
+          // return an earlier same-name account before reaching the real UUID match.
+          const am = (a.accountUuid && accountManager.accounts.find(x => x.accountUuid === a.accountUuid))
+            || accountManager.accounts.find(x => x.name === a.name);
           const live = am ? {
             ...a,
             accessToken: am.credential,
             refreshToken: am.refreshToken,
             expiresAt: am.expiresAt,
           } : a;
-          const diskAcct = diskConfig.accounts.find(
-            d => (a.accountUuid && d.accountUuid === a.accountUuid) || d.name === a.name
-          );
+          const diskAcct = (a.accountUuid && diskConfig.accounts.find(d => d.accountUuid === a.accountUuid))
+            || diskConfig.accounts.find(d => d.name === a.name);
           return diskAcct ? { ...diskAcct, ...live } : live;
         });
+        // The TUI's in-memory config is authoritative for the account SET (an
+        // account it deleted must stay deleted, not be resurrected from the disk
+        // copy this atomic update re-read). An account added to disk by an external
+        // `teamclaude import/login` while the TUI runs is reconciled on the next
+        // reload (R) / restart via syncAccountsFromDisk — not merged here, since we
+        // can't distinguish "added externally" from "deleted locally" at save time.
+        diskConfig.accounts = mapped;
       }),
       syncAccounts: async () => {
         const diskConfig = await loadConfig();
@@ -518,8 +531,10 @@ async function loginApiCommand() {
   }
 
   if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    name = `api-${n}`;
+    // First FREE api-N (not `count + 1`, which collides after a delete) — a unique
+    // name is the identity key for credential-less API-key accounts.
+    let n = 1;
+    do { name = `api-${n++}`; } while (config.accounts.some(a => a.name === name));
   }
 
   config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
@@ -932,8 +947,10 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
   if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-    name = `account-${n}`;
+    // First FREE account-N (not `count + 1`, which collides after a delete) so the
+    // generated name stays a unique identity key.
+    let n = 1;
+    do { name = `account-${n++}`; } while (config.accounts.some(a => a.name === name));
   }
 
   const account = {

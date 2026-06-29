@@ -3,12 +3,10 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
 
-const HOUR = 3600_000;
-
 // Build a TUI wired to a real AccountManager + a config copy, without start()
 // (start() is what touches stdin/stdout — the constructor just sets fields). A
-// mock saveConfig records that a persist happened and what was written.
-function makeTUI(names = ['a0', 'a1']) {
+// mock saveConfig records that a persist happened.
+function makeTUI(names = ['a0', 'a1', 'a2']) {
   const accts = names.map(n => ({ name: n, type: 'apikey', apiKey: `sk-${n}` }));
   const am = new AccountManager(accts.map(a => ({ ...a })), 0.98, 0, 5);
   const config = { accounts: accts.map(a => ({ ...a })) };
@@ -23,50 +21,107 @@ function makeTUI(names = ['a0', 'a1']) {
   return { tui, am, config, saves: () => saves };
 }
 
-test('TUI "o" enters select mode for setting priority', () => {
+// ── entering order mode ────────────────────────────────────────────────────
+
+test('TUI "o" enters select mode for reordering', () => {
   const { tui } = makeTUI();
   tui.mode = 'normal';
   tui._keyNormal('o');
   assert.equal(tui.mode, 'select');
-  assert.equal(tui.selAction, 'priority');
+  assert.equal(tui.selAction, 'order');
 });
 
-test('TUI priority select → Enter opens the numeric input prompt for that account', () => {
-  const { tui } = makeTUI();
-  tui.mode = 'select'; tui.selAction = 'priority'; tui.selIdx = 1;
+test('TUI order select → Enter grabs the account and enters move mode (not input)', () => {
+  const { tui, am } = makeTUI();
+  tui.mode = 'select'; tui.selAction = 'order'; tui.selIdx = 1; // display[1] = a1 (all unranked)
   tui._keySelect('enter');
-  assert.equal(tui.mode, 'input', 'priority needs a value → input mode (not back to normal)');
-  assert.match(tui.inputPrompt, /Priority for "a1"/);
-  assert.equal(typeof tui.inputCb, 'function');
+  assert.equal(tui.mode, 'order', 'reorder needs ↑/↓ movement → order mode, not numeric input');
+  assert.equal(tui.orderAccount, am.accounts[1], 'grabs the selected account by object');
 });
 
-test('TUI priority input sets the account priority and persists it (config + saveConfig)', async () => {
+// ── moving accounts in the order ────────────────────────────────────────────
+
+test('moving an unranked account up ranks it (#1) and leaves the rest on use-or-lose', async () => {
   const { tui, am, config, saves } = makeTUI();
-  tui._promptPriority(1);                 // target a1
-  await tui.inputCb('2');                 // user types "2", Enter
-  assert.equal(am.accounts[1].priority, 2, 'AccountManager priority updated');
-  assert.equal(config.accounts[1].priority, 2, 'config entry persisted');
+  tui._moveOrder(am.accounts[1], -1); // a1 up → becomes the only ranked account
+  assert.equal(am.accounts[1].priority, 0, 'a1 is now ranked (priority 0, shown as #1)');
+  assert.equal(config.accounts[1].priority, 0, 'persisted to config');
+  assert.equal(am.accounts[0].priority, null, 'unranked accounts stay null (use-or-lose)');
+  assert.equal(am.accounts[2].priority, null);
+  assert.equal(tui._rankOf(am.accounts[1]), 1, 'rank badge is the 1-based position');
   assert.equal(saves() >= 1, true, 'saveConfig was called');
-  // a1 now outranks a0 (unset) in selection.
-  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)) });
-  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)) });
-  assert.equal(am._selectBest().name, 'a1');
 });
 
-test('TUI priority input with empty value clears the priority', async () => {
-  const { tui, am, config } = makeTUI();
-  tui._promptPriority(0);
-  await tui.inputCb('3');                 // set first
-  assert.equal(am.accounts[0].priority, 3);
-  tui._promptPriority(0);
-  await tui.inputCb('');                  // empty → clear
-  assert.equal(am.accounts[0].priority, null, 'cleared in AccountManager');
-  // Persisted as explicit null (not a deleted key) so the shared saveConfig
-  // `{...diskAcct, ...live}` merge can't let a stale disk priority survive.
-  assert.equal(config.accounts[0].priority, null, 'config priority set to null');
+test('moving up swaps order among ranked; priorities stay contiguous', async () => {
+  const { tui, am } = makeTUI();
+  tui._moveOrder(am.accounts[0], -1); // a0 → #1 (priority 0)
+  tui._moveOrder(am.accounts[1], -1); // a1 → #2 (priority 1)
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, 1, null]);
+  tui._moveOrder(am.accounts[1], -1); // a1 up → swaps above a0
+  assert.deepEqual(am.accounts.map(a => a.priority), [1, 0, null], 'a1 now #1, a0 #2');
 });
 
-test('a config priority of null loads as "unset" (use-or-lose), matching a cleared key', () => {
+test('moving the last ranked account down un-ranks it (back to use-or-lose)', async () => {
+  const { tui, am } = makeTUI(['a0', 'a1']);
+  tui._moveOrder(am.accounts[0], -1); // a0 #1
+  tui._moveOrder(am.accounts[1], -1); // a1 #2
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, 1]);
+  tui._moveOrder(am.accounts[1], +1); // a1 is last ranked → down → un-rank
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, null], 'a1 back to auto (null)');
+});
+
+test('moving an account that is already top up, or an unranked account down, is a no-op', async () => {
+  const { tui, am } = makeTUI(['a0', 'a1']);
+  tui._moveOrder(am.accounts[0], -1);      // a0 #1
+  tui._moveOrder(am.accounts[0], -1);      // already top → no change
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, null]);
+  tui._moveOrder(am.accounts[1], +1);      // a1 unranked, down → no change
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, null]);
+});
+
+// ── display order ───────────────────────────────────────────────────────────
+
+test('display list shows ranked accounts first (in order), then unranked', async () => {
+  const { tui, am } = makeTUI(['a0', 'a1', 'a2']);
+  tui._moveOrder(am.accounts[2], -1); // a2 #1
+  tui._moveOrder(am.accounts[0], -1); // a0 #2
+  assert.deepEqual(tui._displayList().map(a => a.name), ['a2', 'a0', 'a1'],
+    'ranked (a2, a0) first by order, then unranked a1');
+});
+
+test('order mode: ↑ moves the grabbed account and the selection follows it', () => {
+  const { tui, am } = makeTUI(['a0', 'a1', 'a2']);
+  tui.orderAccount = am.accounts[2];
+  tui.mode = 'order';
+  tui.selIdx = tui._displayList().indexOf(am.accounts[2]); // 2 (unranked, bottom)
+  tui._keyOrder('up'); // ranks a2 → it floats to the top of the (only) ranked group
+  assert.equal(am.accounts[2].priority, 0, 'a2 became ranked');
+  assert.equal(tui._displayList()[tui.selIdx], am.accounts[2], 'selection stays on the moved account');
+});
+
+// ── normalization of legacy / duplicate priority values ─────────────────────
+
+test('duplicate / legacy priority values render as distinct positions and normalize on a move', async () => {
+  const am = new AccountManager([
+    { name: 'a0', type: 'apikey', apiKey: 'k', priority: 1 },
+    { name: 'a1', type: 'apikey', apiKey: 'k', priority: 0 },
+    { name: 'a2', type: 'apikey', apiKey: 'k', priority: 1 }, // duplicate "1"
+  ], 0.98, 0, 5);
+  const config = { accounts: am.accounts.map(a => ({ name: a.name, priority: a.priority })) };
+  const tui = new TUI({ accountManager: am, config, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+
+  // Even with duplicate raw values, the badge shows distinct positions #1..#3.
+  assert.deepEqual(tui._displayList().map(a => a.name), ['a1', 'a0', 'a2'], 'sorted by (priority, index)');
+  assert.equal(tui._rankOf(am.accounts[1]), 1);
+  assert.equal(tui._rankOf(am.accounts[0]), 2);
+  assert.equal(tui._rankOf(am.accounts[2]), 3);
+
+  // A move renumbers everyone to contiguous values (no more duplicates).
+  tui._moveOrder(am.accounts[2], -1); // a2 up one (swap with a0)
+  assert.deepEqual(am.accounts.map(a => a.priority), [2, 0, 1], 'contiguous 0,1,2 — duplicates gone');
+});
+
+test('a config priority of null loads as "unset" (use-or-lose)', () => {
   const am = new AccountManager([
     { name: 'a0', type: 'apikey', apiKey: 'k', priority: null },
     { name: 'a1', type: 'apikey', apiKey: 'k' },
@@ -75,12 +130,22 @@ test('a config priority of null loads as "unset" (use-or-lose), matching a clear
   assert.equal(am._priority(am.accounts[0]), Infinity, 'unset sentinel — no preference');
 });
 
-test('TUI priority input rejects a non-numeric value (no change)', async () => {
-  const { tui, am } = makeTUI();
-  tui._promptPriority(0);
-  await tui.inputCb('abc');
-  assert.equal(am.accounts[0].priority, null, 'invalid input leaves priority unset');
+// ── generated names stay unique (identity key for credential-less accounts) ──
+
+test('generated api names are collision-free after a delete (no duplicate)', async () => {
+  const { tui, config } = makeTUI([]); // start empty
+  await tui._doAddKey('sk-1');         // api-1
+  await tui._doAddKey('sk-2');         // api-2
+  assert.deepEqual(config.accounts.map(a => a.name), ['api-1', 'api-2']);
+  await tui._doRemove(0);              // delete api-1
+  assert.deepEqual(config.accounts.map(a => a.name), ['api-2']);
+  await tui._doAddKey('sk-3');         // must reuse the freed api-1, NOT a 2nd api-2
+  const names = config.accounts.map(a => a.name).sort();
+  assert.equal(new Set(names).size, names.length, 'no duplicate account names');
+  assert.deepEqual(names, ['api-1', 'api-2']);
 });
+
+// ── enable/disable (unchanged) ──────────────────────────────────────────────
 
 test('TUI "e" toggle disables/enables the selected account and persists it', async () => {
   const { tui, am, config } = makeTUI();

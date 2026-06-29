@@ -92,10 +92,29 @@ export async function saveConfig(config) {
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
  * made by other processes (e.g. `teamclaude import` while the server runs).
+ *
+ * Calls are SERIALIZED within this process (via the chain below): atomicConfigUpdate
+ * re-reads the whole file, mutates, and writes it all back, so two concurrent callers
+ * — e.g. a background token refresh and a TUI save/delete — would each read the same
+ * snapshot and the later write would clobber the earlier one's change (resurrecting a
+ * just-deleted account, or dropping a freshly-refreshed token). Chaining makes each
+ * cycle observe the previous cycle's write. Cross-PROCESS races remain (the
+ * single-proxy design assumption); a CLI write while the server runs is reconciled on
+ * the next reload.
  */
-export async function atomicConfigUpdate(updater) {
-  const config = await loadConfig() || createDefaultConfig();
-  await updater(config);
-  await saveConfig(config);
-  return config;
+let _configWriteChain = Promise.resolve();
+
+export function atomicConfigUpdate(updater) {
+  const run = async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await saveConfig(config);
+    return config;
+  };
+  // Run after the previous cycle settles (success OR failure) so one failed update
+  // can't stall the queue; keep the chain itself non-rejecting and surface the
+  // result/error only to this caller.
+  const result = _configWriteChain.then(run, run);
+  _configWriteChain = result.then(() => {}, () => {});
+  return result;
 }

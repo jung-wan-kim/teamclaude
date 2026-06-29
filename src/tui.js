@@ -123,9 +123,10 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input
-    this.selAction = null;   // switch | remove
+    this.mode = 'normal';    // normal | select | add | input | order
+    this.selAction = null;   // switch | remove | toggle | order
     this.selIdx = 0;
+    this.orderAccount = null; // the account being moved while in 'order' mode
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
@@ -220,6 +221,7 @@ export class TUI {
       case 'select': this._keySelect(k); break;
       case 'add':    this._keyAdd(k); break;
       case 'input':  this._keyInput(k); break;
+      case 'order':  this._keyOrder(k); break;
     }
     this.render();
   }
@@ -227,19 +229,26 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex;
+      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this._displayIndexOfCurrent();
     }
     else if (k === 'd' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
     }
     else if (k === 'e' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex;
+      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this._displayIndexOfCurrent();
     }
     else if (k === 'o' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'priority'; this.selIdx = this.am.currentIndex;
+      this.mode = 'select'; this.selAction = 'order'; this.selIdx = this._displayIndexOfCurrent();
     }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
+  }
+
+  /** Display-list index of the currently-active account (0 if not found). */
+  _displayIndexOfCurrent() {
+    const cur = this.am.accounts[this.am.currentIndex];
+    const i = this._displayList().indexOf(cur);
+    return i >= 0 ? i : 0;
   }
 
   _keySelect(k) {
@@ -247,22 +256,43 @@ export class TUI {
     if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
     else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
     else if (k === 'enter') {
+      // selIdx indexes the DISPLAY order (ranked first, then use-or-lose); resolve
+      // to the account object, then act by its live array index (reindex-safe).
+      const acct = this._displayList()[this.selIdx];
+      if (!acct) { this.mode = 'normal'; return; }
       if (this.selAction === 'switch') {
-        this.am.currentIndex = this.selIdx;
-        this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
+        this.am.currentIndex = acct.index;
+        this._addLog(`Switched to "${acct.name}"`);
         this.mode = 'normal';
       } else if (this.selAction === 'toggle') {
-        this._doToggleEnabled(this.selIdx);
+        this._doToggleEnabled(acct.index);
         this.mode = 'normal';
-      } else if (this.selAction === 'priority') {
-        // Priority needs a value → switch into input mode (it sets the mode itself).
-        this._promptPriority(this.selIdx);
+      } else if (this.selAction === 'order') {
+        // Reorder is done by ↑/↓ movement, not a typed number → grab this account
+        // and enter 'order' mode.
+        this.orderAccount = acct;
+        this.mode = 'order';
       } else {
-        this._doRemove(this.selIdx);
+        this._doRemove(acct.index);
         this.mode = 'normal';
       }
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  _keyOrder(k) {
+    if (!this.orderAccount || !this.am.accounts.includes(this.orderAccount)) {
+      this.mode = 'normal'; this.orderAccount = null; return;
+    }
+    if (k === 'up' || k === 'k') {
+      this._moveOrder(this.orderAccount, -1); // sync mutate; save is coalesced inside
+      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+    } else if (k === 'down' || k === 'j') {
+      this._moveOrder(this.orderAccount, +1);
+      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+    } else if (k === 'enter' || k === 'esc' || k === 'q') {
+      this.mode = 'normal'; this.orderAccount = null;
+    }
   }
 
   _keyAdd(k) {
@@ -320,8 +350,10 @@ export class TUI {
         const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
         if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
       } else {
-        const n = this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-        name = `account-${n}`;
+        // Pick the first FREE account-N (not `count + 1`, which collides after a
+        // delete, e.g. delete account-1 then the next import reuses account-2).
+        let n = 1;
+        do { name = `account-${n++}`; } while (this.config.accounts.some(a => a.name === name));
       }
 
       const entry = {
@@ -346,8 +378,13 @@ export class TUI {
         if (prev.enabled !== undefined) entry.enabled = prev.enabled;
         if (prev.priority !== undefined) entry.priority = prev.priority;
         this.config.accounts[idx] = entry;
-        // Update the running account manager entry
-        const amAcct = this.am.accounts[idx];
+        // Update the running account manager entry, matched by IDENTITY (the
+        // previous entry's UUID first, then name) — NOT the config index `idx`,
+        // which can point at a different live account when a tokenless config entry
+        // was skipped at load (config.accounts is not index-aligned with
+        // accountManager.accounts).
+        const amAcct = (prev.accountUuid && this.am.accounts.find(a => a.accountUuid === prev.accountUuid))
+          || this.am.accounts.find(a => a.name === prev.name);
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
@@ -355,6 +392,11 @@ export class TUI {
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
           if (amAcct.status === 'error') amAcct.status = 'active';
+        } else {
+          // The matched config entry had no live AccountManager account (it was
+          // skipped at load — e.g. previously tokenless). Now that we have fresh
+          // credentials, add it so the running server can actually use it.
+          this.am.addAccount(entry);
         }
         this._addLog(`Updated account "${name}"`);
       } else {
@@ -370,8 +412,11 @@ export class TUI {
   }
 
   async _doAddKey(apiKey) {
-    const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    const name = `api-${n}`;
+    // First FREE api-N — a `count + 1` scheme collides after a delete (e.g. add
+    // api-1, api-2; delete api-1; the next add would reuse api-2). A unique name is
+    // the identity key for credential-less API-key accounts, so it must not clash.
+    let n = 1, name;
+    do { name = `api-${n++}`; } while (this.config.accounts.some(a => a.name === name));
     this.config.accounts.push({ name, type: 'apikey', apiKey });
     this.am.addAccount({ name, type: 'apikey', apiKey });
     await this.saveConfig(this.config);
@@ -380,9 +425,18 @@ export class TUI {
 
   async _doRemove(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
-    const name = this.am.accounts[idx].name;
+    const acct = this.am.accounts[idx];
+    const name = acct.name;
+    const uuid = acct.accountUuid;
     this.am.removeAccount(idx);
-    this.config.accounts.splice(idx, 1);
+    // Splice the config entry by IDENTITY, not by the AccountManager index —
+    // config.accounts can hold more entries than AccountManager (tokenless accounts
+    // are skipped at load), so the AM index may delete a different config entry.
+    // Two-phase (UUID first, then name): a single `uuid===c || name===c` predicate
+    // could match an earlier same-name entry before the real UUID match.
+    let cfgIdx = uuid ? this.config.accounts.findIndex(c => c.accountUuid === uuid) : -1;
+    if (cfgIdx < 0) cfgIdx = this.config.accounts.findIndex(c => c.name === name);
+    if (cfgIdx >= 0) this.config.accounts.splice(cfgIdx, 1);
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
     this._addLog(`Deleted account "${name}"`);
@@ -408,41 +462,95 @@ export class TUI {
     this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
   }
 
-  /** Enter input mode to read a new priority for the selected account. */
-  _promptPriority(idx) {
-    const amAcct = this.am.accounts[idx];
-    if (!amAcct) { this.mode = 'normal'; return; }
-    this.mode = 'input';
-    this.inputPrompt = `Priority for "${amAcct.name}" (number, lower = preferred; empty to clear)`;
-    this.inputBuf = amAcct.priority != null ? String(amAcct.priority) : '';
-    // Capture the account object (not the index) so a concurrent re-index can't
-    // misattribute the change while the user is typing.
-    this.inputCb = v => this._doSetPriority(amAcct, v);
+  // ── ordering (priority expressed as a movable rank, not a typed number) ──────
+  //
+  // The user sets preference by moving accounts up/down, not by entering a number.
+  // Ranked accounts get contiguous priorities 0,1,2,… (0 = most preferred and
+  // shown as "#1"); accounts left unranked keep priority null and are routed by
+  // use-or-lose (soonest reset, then least used). So pinning a few accounts to an
+  // explicit order leaves the rest on the auto rotation.
+
+  /** Ranked accounts (priority set), in order: priority asc, then array index. */
+  _rankedSorted() {
+    return this.am.accounts
+      .filter(a => a.priority != null)
+      .sort((a, b) => (a.priority - b.priority) || (a.index - b.index));
   }
 
-  async _doSetPriority(amAcct, raw) {
-    if (!this.am.accounts.includes(amAcct)) return; // removed while typing
-    const trimmed = (raw || '').trim();
-    let value = null; // empty or "clear" → clear the priority (back to use-or-lose)
-    if (trimmed !== '' && trimmed.toLowerCase() !== 'clear') {
-      const n = Number(trimmed);
-      if (!Number.isFinite(n)) { this._addLog(`Invalid priority "${trimmed}" — expected a number`); return; }
-      value = Math.floor(n);
+  /** Display order: ranked accounts first (in order), then unranked (array order). */
+  _displayList() {
+    const ranked = this._rankedSorted();
+    const set = new Set(ranked);
+    return [...ranked, ...this.am.accounts.filter(a => !set.has(a))];
+  }
+
+  /** 1-based rank position among the ranked accounts, or null if unranked. */
+  _rankOf(account) {
+    if (account.priority == null) return null;
+    return this._rankedSorted().indexOf(account) + 1;
+  }
+
+  /**
+   * Move an account up (dir < 0, more preferred) or down (dir > 0) in the order.
+   * Moving an unranked account up ranks it at the bottom of the ranked group;
+   * moving the last ranked account down un-ranks it (back to use-or-lose). After
+   * the move, ranked accounts are renumbered to contiguous priorities 0..n-1 (also
+   * normalizing any duplicate/legacy values), and every changed account is
+   * persisted onto its config entry (matched UUID-first, then name).
+   */
+  _moveOrder(account, dir) {
+    if (!this.am.accounts.includes(account)) return;
+    const ranked = this._rankedSorted();
+    const r = ranked.indexOf(account);
+
+    if (dir < 0) {                       // up — more preferred
+      if (r === -1) ranked.push(account);                                          // unranked → lowest ranked
+      else if (r > 0) { const t = ranked[r - 1]; ranked[r - 1] = ranked[r]; ranked[r] = t; }
+      else return;                                                                 // already at the top
+    } else {                             // down — less preferred
+      if (r === -1) return;                                                        // unranked: nothing below
+      else if (r < ranked.length - 1) { const t = ranked[r + 1]; ranked[r + 1] = ranked[r]; ranked[r] = t; }
+      else ranked.splice(r, 1);                                                    // last ranked → un-rank
     }
-    this.am.setPriority(amAcct, value);
-    // Persist onto the config entry matched by identity (UUID-first, then name) —
-    // same reasoning as _doToggleEnabled (display index may not map onto config).
-    // Clearing writes `null` rather than deleting the key: saveConfig persists via
-    // `{...diskAcct, ...live}`, so a deleted key would let the stale disk priority
-    // survive the merge. An explicit null overrides it (and loads as "unset", since
-    // _priority treats any non-finite value as no preference).
-    const cfg = (amAcct.accountUuid && this.config.accounts.find(a => a.accountUuid === amAcct.accountUuid))
-      || this.config.accounts.find(a => a.name === amAcct.name);
-    if (cfg) cfg.priority = value; // value is null when clearing
-    await this.saveConfig(this.config);
-    this._addLog(value === null
-      ? `Cleared priority for "${amAcct.name}"`
-      : `Set priority of "${amAcct.name}" to ${value}`);
+
+    // Reassign contiguous priorities (ranked → its index; everyone else → null),
+    // mutating the live AccountManager and the config in lockstep.
+    const set = new Set(ranked);
+    for (const a of this.am.accounts) {
+      const want = set.has(a) ? ranked.indexOf(a) : null;
+      if (a.priority === want) continue;
+      this.am.setPriority(a, want);
+      // Persist onto the config entry by identity (UUID-first, then name) — the
+      // display index may not map 1:1 onto config.accounts. Write `null` (not a
+      // deleted key) to clear, so the saveConfig `{...diskAcct, ...live}` merge
+      // can't let a stale disk priority survive.
+      const cfg = (a.accountUuid && this.config.accounts.find(c => c.accountUuid === a.accountUuid))
+        || this.config.accounts.find(c => c.name === a.name);
+      if (cfg) cfg.priority = want;
+    }
+    // Persist via the coalescing saver: rapid ↑/↓ presses mutate synchronously but
+    // share a single in-flight write whose final pass reflects the latest order, so
+    // an out-of-order completion can't persist a stale snapshot.
+    this._scheduleSave();
+  }
+
+  /**
+   * Serialize config writes triggered by rapid order moves. Only one save runs at
+   * a time; further changes during it set `_saveDirty`, and the loop runs one more
+   * pass with the latest `this.config` when the current write finishes — so the
+   * last write always reflects the newest state (no lost-update race).
+   */
+  _scheduleSave() {
+    this._saveDirty = true;
+    if (this._saving) return;
+    this._saving = (async () => {
+      while (this._saveDirty) {
+        this._saveDirty = false;
+        try { await this.saveConfig(this.config); }
+        catch (e) { this._addLog(`Save failed: ${e.message}`); }
+      }
+      this._saving = null;
+    })();
   }
 
   // ── rendering ──────────────────────────────────────
@@ -477,8 +585,9 @@ export class TUI {
         ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
         : Math.max(5, Math.min(20, W - 45));
 
-      for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth));
+      const display = this._displayList();
+      for (let pos = 0; pos < display.length; pos++) {
+        lines.push(this._renderAcct(display[pos], pos, bw, showBoth));
       }
     }
 
@@ -523,13 +632,15 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth) {
-    const a = this.am.accounts[idx];
-    const isCur = idx === this.am.currentIndex;
-    const isSel = this.mode === 'select' && idx === this.selIdx;
+  _renderAcct(a, pos, bw, showBoth) {
+    const isCur = a === this.am.accounts[this.am.currentIndex];
+    // Highlight the selection in both select and order modes; in order mode the
+    // grabbed account gets a distinct move marker.
+    const isSel = (this.mode === 'select' || this.mode === 'order') && pos === this.selIdx;
+    const isMoving = this.mode === 'order' && a === this.orderAccount;
 
-    // Prefix: selection marker + current marker
-    const sel = isSel ? cyan('>') : ' ';
+    // Prefix: selection / move marker + current marker
+    const sel = isMoving ? cyan('⇅') : isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
 
     // Name (bold if selected)
@@ -582,9 +693,13 @@ export class TUI {
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
-    // Explicit selection priority marker (appended at the end so it never
-    // disrupts the fixed-width columns / quota bars).
-    if (a.priority != null) line += `  ${dim('P' + a.priority)}`;
+    // Order badge: ranked accounts show their 1-based position (#1 = most
+    // preferred). While ordering, unranked accounts are labelled "auto" so the
+    // two groups (pinned order vs use-or-lose) are visible. Appended last so it
+    // never disrupts the fixed-width columns / quota bars.
+    const rank = this._rankOf(a);
+    if (rank != null) line += `  ${dim('#' + rank)}`;
+    else if (this.mode === 'order') line += `  ${dim('auto')}`;
     return line;
   }
 
@@ -595,10 +710,12 @@ export class TUI {
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'
-            : this.selAction === 'priority' ? 'set priority'
+            : this.selAction === 'order' ? 'reorder'
               : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
+      case 'order':
+        return ` ${dim('↑↓')} move (up = preferred)  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
