@@ -958,3 +958,12 @@ test('disabling an affinity-pinned account drops its keep-alive connection (hard
   assert.notEqual(a3.name, a1.name, 'a disabled account no longer serves its affinity-pinned connection');
   assert.equal(a3.enabled !== false, true);
 });
+
+test('totalCapacity excludes disabled accounts (tight admission bound)', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 4, 10); // cap 4/account, queue depth 10
+  assert.equal(am.totalCapacity(), 3 * 4 + 10, 'all enabled: 3 caps + queue');
+  am.setEnabled('a1', false);
+  assert.equal(am.totalCapacity(), 2 * 4 + 10, 'disabled account contributes 0 capacity');
+  am.setEnabled('a1', true);
+  assert.equal(am.totalCapacity(), 3 * 4 + 10, 're-enabled account counts again');
+});

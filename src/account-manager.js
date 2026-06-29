@@ -327,9 +327,17 @@ export class AccountManager {
     return this._waiters.length >= this.maxQueueDepth;
   }
 
-  /** Upper bound on useful concurrent requests: sum of caps + the queue depth. */
+  /**
+   * Upper bound on useful concurrent requests: sum of *enabled* accounts' caps +
+   * the queue depth. A disabled account serves nothing, so excluding its cap
+   * keeps the proxy's global admission bound (server.js) tight against the
+   * capacity that can actually run, rather than admitting/buffering requests
+   * against dead capacity only to 429 them later.
+   */
   totalCapacity() {
-    return this.accounts.reduce((sum, a) => sum + a.maxConcurrent, 0) + this.maxQueueDepth;
+    const caps = this.accounts.reduce(
+      (sum, a) => sum + (a.enabled === false ? 0 : a.maxConcurrent), 0);
+    return caps + this.maxQueueDepth;
   }
 
   _enqueue(exclude, timeoutMs, signal = null, affinityKey = null) {
