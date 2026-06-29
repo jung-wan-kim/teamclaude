@@ -123,9 +123,8 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | order
-    this.selAction = null;   // switch | remove | toggle | order
-    this.selIdx = 0;
+    this.mode = 'normal';    // normal | select (delete-confirm) | add | input | order
+    this.selIdx = 0;         // cursor over the account list (normal/select/order)
     this.orderAccount = null; // the account being moved while in 'order' mode
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -227,30 +226,31 @@ export class TUI {
   }
 
   _keyNormal(k) {
-    if (k === 'q') { this.stop(); this.onQuit?.(); }
-    else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this._displayIndexOfCurrent();
-    }
-    else if (k === 'd' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
-    }
-    else if (k === 'e' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this._displayIndexOfCurrent();
-    }
-    else if (k === 'o' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'order'; this.selIdx = this._displayIndexOfCurrent();
-    }
-    else if (k === 'a') { this.mode = 'add'; }
-    else if (k === 'R') { this._doSync(); }
+    if (k === 'q') { this.stop(); this.onQuit?.(); return; }
+    if (k === 'a') { this.mode = 'add'; return; }
+    if (k === 'R') { this._doSync(); return; }
+
+    const len = this.am.accounts.length;
+    if (len === 0) return;
+    if (this.selIdx >= len) this.selIdx = len - 1; // keep the cursor in range
+    const selected = () => this._displayList()[this.selIdx];
+
+    // ↑/↓ (or k/j) move a selection cursor over the account list right here in the
+    // default view — no need to enter a sub-mode first.
+    if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
+    else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+    // The action keys act DIRECTLY on the cursor-selected account.
+    else if (k === 's') { const a = selected(); if (a) { this.am.currentIndex = a.index; this._addLog(`Switched to "${a.name}"`); } }
+    else if (k === 'e') { const a = selected(); if (a) this._doToggleEnabled(a.index); }
+    else if (k === 'o') { const a = selected(); if (a) { this.orderAccount = a; this.mode = 'order'; } }
+    // Delete keeps an explicit confirmation (it's destructive): the cursor account
+    // is pre-selected and Enter in select mode confirms.
+    else if (k === 'd') { this.mode = 'select'; }
   }
 
-  /** Display-list index of the currently-active account (0 if not found). */
-  _displayIndexOfCurrent() {
-    const cur = this.am.accounts[this.am.currentIndex];
-    const i = this._displayList().indexOf(cur);
-    return i >= 0 ? i : 0;
-  }
-
+  // Select mode is now the DELETE confirmation only — switch / enable-disable /
+  // order act directly on the normal-mode ↑/↓ cursor. Here ↑/↓ let you re-pick
+  // before confirming; Enter deletes the selected account, Esc cancels.
   _keySelect(k) {
     const len = this.am.accounts.length;
     if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
@@ -259,23 +259,8 @@ export class TUI {
       // selIdx indexes the DISPLAY order (ranked first, then use-or-lose); resolve
       // to the account object, then act by its live array index (reindex-safe).
       const acct = this._displayList()[this.selIdx];
-      if (!acct) { this.mode = 'normal'; return; }
-      if (this.selAction === 'switch') {
-        this.am.currentIndex = acct.index;
-        this._addLog(`Switched to "${acct.name}"`);
-        this.mode = 'normal';
-      } else if (this.selAction === 'toggle') {
-        this._doToggleEnabled(acct.index);
-        this.mode = 'normal';
-      } else if (this.selAction === 'order') {
-        // Reorder is done by ↑/↓ movement, not a typed number → grab this account
-        // and enter 'order' mode.
-        this.orderAccount = acct;
-        this.mode = 'order';
-      } else {
-        this._doRemove(acct.index);
-        this.mode = 'normal';
-      }
+      if (acct) this._doRemove(acct.index);
+      this.mode = 'normal';
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
@@ -636,7 +621,7 @@ export class TUI {
     const isCur = a === this.am.accounts[this.am.currentIndex];
     // Highlight the selection in both select and order modes; in order mode the
     // grabbed account gets a distinct move marker.
-    const isSel = (this.mode === 'select' || this.mode === 'order') && pos === this.selIdx;
+    const isSel = (this.mode === 'normal' || this.mode === 'select' || this.mode === 'order') && pos === this.selIdx;
     const isMoving = this.mode === 'order' && a === this.orderAccount;
 
     // Prefix: selection / move marker + current marker
@@ -706,14 +691,9 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('d')}elete  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('R')}eload  ${bold('q')}uit`;
-      case 'select': {
-        const act = this.selAction === 'switch' ? 'switch'
-          : this.selAction === 'toggle' ? 'enable/disable'
-            : this.selAction === 'order' ? 'reorder'
-              : 'delete';
-        return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
-      }
+        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('d')}elete  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+      case 'select':
+        return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
       case 'order':
         return ` ${dim('↑↓')} move (up = preferred)  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':

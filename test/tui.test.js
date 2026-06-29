@@ -21,22 +21,57 @@ function makeTUI(names = ['a0', 'a1', 'a2']) {
   return { tui, am, config, saves: () => saves };
 }
 
-// ── entering order mode ────────────────────────────────────────────────────
+// ── normal-mode cursor: ↑/↓ select, action keys act on the selection ─────────
 
-test('TUI "o" enters select mode for reordering', () => {
-  const { tui } = makeTUI();
-  tui.mode = 'normal';
-  tui._keyNormal('o');
-  assert.equal(tui.mode, 'select');
-  assert.equal(tui.selAction, 'order');
+test('normal mode: ↑/↓ move a selection cursor over the accounts (clamped at ends)', () => {
+  const { tui } = makeTUI(['a0', 'a1', 'a2']);
+  tui.mode = 'normal'; tui.selIdx = 0;
+  tui._keyNormal('down'); assert.equal(tui.selIdx, 1);
+  tui._keyNormal('down'); assert.equal(tui.selIdx, 2);
+  tui._keyNormal('down'); assert.equal(tui.selIdx, 2, 'clamped at the last account');
+  tui._keyNormal('up');   assert.equal(tui.selIdx, 1);
+  tui._keyNormal('up'); tui._keyNormal('up'); assert.equal(tui.selIdx, 0, 'clamped at the top');
 });
 
-test('TUI order select → Enter grabs the account and enters move mode (not input)', () => {
-  const { tui, am } = makeTUI();
-  tui.mode = 'select'; tui.selAction = 'order'; tui.selIdx = 1; // display[1] = a1 (all unranked)
-  tui._keySelect('enter');
-  assert.equal(tui.mode, 'order', 'reorder needs ↑/↓ movement → order mode, not numeric input');
-  assert.equal(tui.orderAccount, am.accounts[1], 'grabs the selected account by object');
+test('normal mode: "s" switches to the ↑/↓-selected account directly (no sub-mode)', () => {
+  const { tui, am } = makeTUI(['a0', 'a1', 'a2']);
+  tui.mode = 'normal'; tui.selIdx = 2; // all unranked → display order == am order
+  tui._keyNormal('s');
+  assert.equal(am.currentIndex, 2, 'active account is the selected one');
+  assert.equal(tui.mode, 'normal');
+});
+
+test('normal mode: "e" toggles the ↑/↓-selected account directly', () => {
+  const { tui, am } = makeTUI(['a0', 'a1']);
+  tui.mode = 'normal'; tui.selIdx = 1;
+  tui._keyNormal('e');
+  assert.equal(am.accounts[1].enabled, false, 'selected account disabled directly');
+});
+
+test('normal mode: "o" grabs the ↑/↓-selected account into order (move) mode', () => {
+  const { tui, am } = makeTUI(['a0', 'a1', 'a2']);
+  tui.mode = 'normal'; tui.selIdx = 1;
+  tui._keyNormal('o');
+  assert.equal(tui.mode, 'order');
+  assert.equal(tui.orderAccount, am.accounts[1], 'grabs the selected account');
+});
+
+test('normal mode: "d" asks for confirmation (enters select mode, not a direct delete)', () => {
+  const { tui } = makeTUI(['a0', 'a1']);
+  tui.mode = 'normal'; tui.selIdx = 1;
+  tui._keyNormal('d');
+  assert.equal(tui.mode, 'select', 'delete is destructive → confirmation step, not a direct action');
+});
+
+test('select-mode (delete) → Enter removes the cursor account, Esc cancels', async () => {
+  const { tui, config } = makeTUI(['a0', 'a1', 'a2']);
+  tui.mode = 'select'; tui.selIdx = 1;          // cursor on a1
+  tui._keySelect('esc');
+  assert.equal(tui.mode, 'normal');
+  assert.deepEqual(config.accounts.map(a => a.name), ['a0', 'a1', 'a2'], 'Esc cancels — nothing removed');
+  // Enter path delegates to _doRemove (awaited here to assert its effect deterministically).
+  await tui._doRemove(tui._displayList()[1].index);
+  assert.deepEqual(config.accounts.map(a => a.name), ['a0', 'a2'], 'a1 removed on confirm');
 });
 
 // ── moving accounts in the order ────────────────────────────────────────────
