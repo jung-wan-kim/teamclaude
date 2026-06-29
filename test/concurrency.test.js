@@ -865,3 +865,21 @@ test('enabled + priority survive a getStatus round-trip from config-style input'
   assert.equal(st.accounts[1].enabled, true, 'default enabled when unset');
   assert.equal(st.accounts[1].priority, null, 'default null priority when unset');
 });
+
+test('setEnabled/setPriority reject a bare numeric index (object-handle invariant)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  // A stale index after a removeAccount would otherwise hit the wrong account;
+  // the setters accept only an account object or a name.
+  assert.equal(am.setEnabled(0, false), null, 'numeric index rejected');
+  assert.equal(am.setPriority(1, 5), null, 'numeric index rejected');
+  assert.equal(am.accounts.every(a => a.enabled !== false), true, 'no account was disabled');
+  assert.equal(am.accounts.every(a => a.priority == null), true, 'no priority was set');
+});
+
+test('setEnabled on a removed account object returns null (no misattribution after re-index)', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 5);
+  const a0 = am.accounts[0];
+  am.removeAccount(0);                       // a1,a2 shift down to index 0,1
+  assert.equal(am.setEnabled(a0, false), null, 'stale removed object resolves to null');
+  assert.equal(am.accounts.every(a => a.enabled !== false), true, 'survivors untouched');
+});

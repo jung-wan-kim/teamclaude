@@ -815,12 +815,17 @@ export class AccountManager {
   }
 
   /**
-   * Resolve a caller-facing account reference — an account object, a numeric
-   * index, or a name string — to the live account object (or null). Used by the
-   * public setEnabled/setPriority so callers can name an account.
+   * Resolve a caller-facing account reference — an account object or a name
+   * string — to the live account object (or null). Used by the public
+   * setEnabled/setPriority.
+   *
+   * A bare numeric index is intentionally NOT accepted here (unlike the internal
+   * `_resolve`): a setter is a mutation, and an index captured before a
+   * removeAccount() re-index would silently disable/reprioritize whatever account
+   * shifted into that slot. Callers pass the account object (TUI / sync) or its
+   * name (CLI) — both survive a re-index.
    */
   _resolveRef(ref) {
-    if (typeof ref === 'number') return this.accounts[ref] || null;
     if (typeof ref === 'string') return this.accounts.find(a => a.name === ref) || null;
     if (ref && typeof ref === 'object') return this.accounts.includes(ref) ? ref : null;
     return null;
