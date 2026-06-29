@@ -959,13 +959,38 @@ test('disabling an affinity-pinned account drops its keep-alive connection (hard
   assert.equal(a3.enabled !== false, true);
 });
 
-test('totalCapacity excludes disabled accounts (tight admission bound)', () => {
+test('totalCapacity includes disabled accounts so draining in-flight stays within the admission bound', () => {
   const am = new AccountManager(makeAccounts(3), 0.98, 0, 4, 10); // cap 4/account, queue depth 10
-  assert.equal(am.totalCapacity(), 3 * 4 + 10, 'all enabled: 3 caps + queue');
+  const full = 3 * 4 + 10;
+  assert.equal(am.totalCapacity(), full, 'all caps + queue');
   am.setEnabled('a1', false);
-  assert.equal(am.totalCapacity(), 2 * 4 + 10, 'disabled account contributes 0 capacity');
+  // The bound must NOT drop: requests already draining on a just-disabled account
+  // still count in inFlightProxied, and enabled accounts should keep being served.
+  assert.equal(am.totalCapacity(), full, 'disabling does not shrink the admission ceiling');
   am.setEnabled('a1', true);
-  assert.equal(am.totalCapacity(), 3 * 4 + 10, 're-enabled account counts again');
+  assert.equal(am.totalCapacity(), full);
+});
+
+test('a busy account being disabled does not 429 new requests the enabled accounts can serve', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 2, 0); // cap 2/account, queue depth 0
+  measureAll(am);
+  // Fill account a0 to its cap (2 in-flight), leaving a1 idle.
+  const held = [];
+  while (true) {
+    const a = await am.acquireAccount(null, 0);
+    if (!a || a.name !== 'a0') { if (a) am.releaseAccount(a); break; }
+    held.push(a);
+    if (held.length === 2) break;
+  }
+  const a0 = am.accounts.find(a => a.name === 'a0');
+  assert.equal(a0.inflight, 2, 'a0 is at its cap with draining requests');
+  am.setEnabled('a0', false);                  // disable the busy account
+  // a1 is enabled and idle — a new request must still acquire it, not be refused.
+  const next = await am.acquireAccount(null, 0);
+  assert.notEqual(next, null, 'enabled idle account still serves new requests');
+  assert.equal(next.name, 'a1');
+  held.forEach(h => am.releaseAccount(h));
+  am.releaseAccount(next);
 });
 
 test('a very large explicit priority still outranks an unset account', () => {
