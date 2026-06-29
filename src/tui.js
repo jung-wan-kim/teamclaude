@@ -235,6 +235,9 @@ export class TUI {
     else if (k === 'e' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex;
     }
+    else if (k === 'o' && this.am.accounts.length > 0) {
+      this.mode = 'select'; this.selAction = 'priority'; this.selIdx = this.am.currentIndex;
+    }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
   }
@@ -247,12 +250,17 @@ export class TUI {
       if (this.selAction === 'switch') {
         this.am.currentIndex = this.selIdx;
         this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
+        this.mode = 'normal';
       } else if (this.selAction === 'toggle') {
         this._doToggleEnabled(this.selIdx);
+        this.mode = 'normal';
+      } else if (this.selAction === 'priority') {
+        // Priority needs a value → switch into input mode (it sets the mode itself).
+        this._promptPriority(this.selIdx);
       } else {
         this._doRemove(this.selIdx);
+        this.mode = 'normal';
       }
-      this.mode = 'normal';
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
@@ -398,6 +406,39 @@ export class TUI {
     if (cfg) cfg.enabled = newEnabled;
     await this.saveConfig(this.config);
     this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
+  }
+
+  /** Enter input mode to read a new priority for the selected account. */
+  _promptPriority(idx) {
+    const amAcct = this.am.accounts[idx];
+    if (!amAcct) { this.mode = 'normal'; return; }
+    this.mode = 'input';
+    this.inputPrompt = `Priority for "${amAcct.name}" (number, lower = preferred; empty to clear)`;
+    this.inputBuf = amAcct.priority != null ? String(amAcct.priority) : '';
+    // Capture the account object (not the index) so a concurrent re-index can't
+    // misattribute the change while the user is typing.
+    this.inputCb = v => this._doSetPriority(amAcct, v);
+  }
+
+  async _doSetPriority(amAcct, raw) {
+    if (!this.am.accounts.includes(amAcct)) return; // removed while typing
+    const trimmed = (raw || '').trim();
+    let value = null; // empty or "clear" → clear the priority (back to use-or-lose)
+    if (trimmed !== '' && trimmed.toLowerCase() !== 'clear') {
+      const n = Number(trimmed);
+      if (!Number.isFinite(n)) { this._addLog(`Invalid priority "${trimmed}" — expected a number`); return; }
+      value = Math.floor(n);
+    }
+    this.am.setPriority(amAcct, value);
+    // Persist onto the config entry matched by identity (UUID-first, then name) —
+    // same reasoning as _doToggleEnabled (display index may not map onto config).
+    const cfg = (amAcct.accountUuid && this.config.accounts.find(a => a.accountUuid === amAcct.accountUuid))
+      || this.config.accounts.find(a => a.name === amAcct.name);
+    if (cfg) { if (value === null) delete cfg.priority; else cfg.priority = value; }
+    await this.saveConfig(this.config);
+    this._addLog(value === null
+      ? `Cleared priority for "${amAcct.name}"`
+      : `Set priority of "${amAcct.name}" to ${value}`);
   }
 
   // ── rendering ──────────────────────────────────────
@@ -546,11 +587,12 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('d')}elete  ${bold('e')}nable/disable  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('d')}elete  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('R')}eload  ${bold('q')}uit`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'
-            : 'delete';
+            : this.selAction === 'priority' ? 'set priority'
+              : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':
