@@ -995,6 +995,31 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       continue;
     }
 
+    // Find the corresponding AccountManager entry — UUID first, then name, so a
+    // disk entry whose UUID and name resolve to *different* live accounts can't
+    // misattribute the update to the name-match when a UUID-match exists.
+    const mgr = (diskAcct.accountUuid && accountManager.accounts.find(a => a.accountUuid === diskAcct.accountUuid))
+      || accountManager.accounts.find(a => a.name === diskAcct.name);
+
+    // Apply enable/disable + priority from disk FIRST — independent of credential
+    // re-resolution below. A failed re-import (freshCred null) must NOT strand a
+    // `teamclaude disable`/`priority` set while the server runs. setEnabled drains
+    // the overflow queue when re-enabling so a freed-up account is used at once.
+    if (mgr) {
+      const wantEnabled = diskAcct.enabled !== false;
+      if (mgr.enabled !== wantEnabled) accountManager.setEnabled(mgr, wantEnabled);
+      const diskPriority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
+      if (mgr.priority !== diskPriority) accountManager.setPriority(mgr, diskPriority);
+      // Mirror the applied state into the in-memory config copy too. Otherwise a
+      // later TUI saveConfig (for any unrelated op) would spread the pre-sync
+      // enabled/priority over the disk value and silently revert a CLI change.
+      const memAcct = memConfig.accounts[memIdx];
+      if (memAcct) {
+        if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
+        if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
+      }
+    }
+
     // Existing account — resolve fresh credentials from disk
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
@@ -1010,30 +1035,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       freshCred = { apiKey: diskAcct.apiKey };
     }
 
-    if (!freshCred) continue;
-
-    // Find the corresponding AccountManager entry — UUID first, then name, so a
-    // disk entry whose UUID and name resolve to *different* live accounts can't
-    // misattribute the update to the name-match when a UUID-match exists.
-    const mgr = (diskAcct.accountUuid && accountManager.accounts.find(a => a.accountUuid === diskAcct.accountUuid))
-      || accountManager.accounts.find(a => a.name === diskAcct.name);
-    if (!mgr) continue;
-
-    // Apply enable/disable + priority from disk (e.g. set by `teamclaude
-    // disable/enable/priority` while the server runs). setEnabled drains the
-    // overflow queue when re-enabling so a freed-up account is used immediately.
-    const wantEnabled = diskAcct.enabled !== false;
-    if (mgr.enabled !== wantEnabled) accountManager.setEnabled(mgr, wantEnabled);
-    const diskPriority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
-    if (mgr.priority !== diskPriority) accountManager.setPriority(mgr, diskPriority);
-    // Mirror the applied state into the in-memory config copy too. Otherwise a
-    // later TUI saveConfig (for any unrelated op) would spread the pre-sync
-    // enabled/priority over the disk value and silently revert a CLI change.
-    const memAcct = memConfig.accounts[memIdx];
-    if (memAcct) {
-      if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
-      if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
-    }
+    if (!freshCred || !mgr) continue;
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
