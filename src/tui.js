@@ -379,9 +379,15 @@ export class TUI {
     if (!amAcct) return;
     const newEnabled = amAcct.enabled === false; // currently disabled → enable, else disable
     // Mutate the live AccountManager (excludes/includes it in rotation, drains
-    // waiters on enable) AND the config copy so saveConfig persists the flag.
+    // waiters on enable). Persist the flag onto the matching config entry found
+    // by identity — config.accounts can hold more entries than AccountManager
+    // (tokenless accounts are skipped at load), so the display index may not map
+    // 1:1 onto config.accounts. Matching by UUID/name avoids corrupting a
+    // different config entry.
     this.am.setEnabled(amAcct, newEnabled);
-    if (this.config.accounts[idx]) this.config.accounts[idx].enabled = newEnabled;
+    const cfg = this.config.accounts.find(a =>
+      (amAcct.accountUuid && a.accountUuid === amAcct.accountUuid) || a.name === amAcct.name);
+    if (cfg) cfg.enabled = newEnabled;
     await this.saveConfig(this.config);
     this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
   }

@@ -1064,7 +1064,9 @@ async function resolveAccounts(config) {
       if (acct.importFrom) {
         try {
           const creds = await importCredentials(acct.importFrom);
-          accounts.push({ name: acct.name, type: 'oauth', maxConcurrent: acct.maxConcurrent, enabled: acct.enabled, priority: acct.priority, ...creds });
+          // Carry accountUuid through so the live account can be matched UUID-first
+          // on sync (otherwise it stays null and a name change misroutes the update).
+          accounts.push({ name: acct.name, type: 'oauth', accountUuid: acct.accountUuid, maxConcurrent: acct.maxConcurrent, enabled: acct.enabled, priority: acct.priority, ...creds });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
