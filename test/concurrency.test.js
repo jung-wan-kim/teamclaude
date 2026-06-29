@@ -943,3 +943,18 @@ test('clearing a priority restores use-or-lose routing immediately (reeval off)'
   am.setPriority('a0', null);                   // clear it → both equal priority
   assert.equal(am.getActiveAccount().name, 'a1', 'use-or-lose (soonest reset) restored after clear');
 });
+
+test('disabling an affinity-pinned account drops its keep-alive connection (hard exclusion)', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  const key = {}; // client socket stand-in
+
+  const a1 = await am.acquireAccount(null, 0, null, key); am.releaseAccount(a1.index);
+  const a2 = await am.acquireAccount(null, 0, null, key); am.releaseAccount(a2.index);
+  assert.equal(a2.name, a1.name, 'affinity pins the connection to one account');
+
+  am.setEnabled(a1, false);                    // disable the affinity home
+  const a3 = await am.acquireAccount(null, 0, null, key);
+  assert.notEqual(a3.name, a1.name, 'a disabled account no longer serves its affinity-pinned connection');
+  assert.equal(a3.enabled !== false, true);
+});
