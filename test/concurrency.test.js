@@ -959,16 +959,23 @@ test('disabling an affinity-pinned account drops its keep-alive connection (hard
   assert.equal(a3.enabled !== false, true);
 });
 
-test('totalCapacity includes disabled accounts so draining in-flight stays within the admission bound', () => {
+test('totalCapacity: enabled caps + disabled in-flight + queue', async () => {
   const am = new AccountManager(makeAccounts(3), 0.98, 0, 4, 10); // cap 4/account, queue depth 10
-  const full = 3 * 4 + 10;
-  assert.equal(am.totalCapacity(), full, 'all caps + queue');
+  measureAll(am);
+  assert.equal(am.totalCapacity(), 3 * 4 + 10, 'all enabled: 3 caps + queue');
+
+  // Disabling an IDLE account drops the ceiling by its cap (no draining, no future capacity).
   am.setEnabled('a1', false);
-  // The bound must NOT drop: requests already draining on a just-disabled account
-  // still count in inFlightProxied, and enabled accounts should keep being served.
-  assert.equal(am.totalCapacity(), full, 'disabling does not shrink the admission ceiling');
+  assert.equal(am.totalCapacity(), 2 * 4 + 0 + 10, 'idle disabled account contributes 0');
+
+  // A disabled account with draining in-flight contributes exactly that in-flight.
   am.setEnabled('a1', true);
-  assert.equal(am.totalCapacity(), full);
+  const h1 = await am.acquireAccount(null, 0, null, {}); // put one in flight somewhere
+  const busy = h1.name;
+  am.setEnabled(busy, false);
+  const expected = am.accounts.reduce((s, a) => s + (a.enabled === false ? a.inflight : a.maxConcurrent), 0) + 10;
+  assert.equal(am.totalCapacity(), expected, 'disabled account counts its draining in-flight');
+  am.releaseAccount(h1);
 });
 
 test('a busy account being disabled does not 429 new requests the enabled accounts can serve', async () => {

@@ -329,21 +329,22 @@ export class AccountManager {
 
   /**
    * Upper bound on concurrent in-flight requests the proxy may admit (server.js
-   * caps `inFlightProxied` to this to bound buffered memory): sum of EVERY
-   * account's cap + the queue depth.
+   * caps `inFlightProxied` to this to bound buffered memory): each ENABLED
+   * account contributes its full cap (capacity it can still take), each DISABLED
+   * account contributes only its *current* in-flight (requests still draining —
+   * it accepts no new ones), plus the queue depth.
    *
-   * Disabled accounts are deliberately INCLUDED. The bound is compared against
-   * `inFlightProxied`, which counts requests already in flight — including ones
-   * still draining on an account that was just disabled (disabling doesn't kill
-   * them). Excluding a disabled account's cap would drop the ceiling below those
-   * draining requests and 429 new requests that the *enabled* accounts could
-   * still serve. A disabled account also never inflates real usage: a new request
-   * routed nowhere returns null from acquireAccount and 429s immediately rather
-   * than buffering, so counting its cap only loosens a memory bound, never admits
-   * work that can't run.
+   * This is the tightest bound that's still safe: it covers the draining requests
+   * on a just-disabled account (so they can't push inFlightProxied over the
+   * ceiling and 429 traffic the enabled accounts could serve), without admitting
+   * fresh requests against a disabled account's dead future capacity (which could
+   * only be buffered and then 429'd at acquire). As those draining requests
+   * finish, the disabled account's contribution falls to zero.
    */
   totalCapacity() {
-    return this.accounts.reduce((sum, a) => sum + a.maxConcurrent, 0) + this.maxQueueDepth;
+    const caps = this.accounts.reduce(
+      (sum, a) => sum + (a.enabled === false ? a.inflight : a.maxConcurrent), 0);
+    return caps + this.maxQueueDepth;
   }
 
   _enqueue(exclude, timeoutMs, signal = null, affinityKey = null) {
