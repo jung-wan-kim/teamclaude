@@ -883,3 +883,32 @@ test('setEnabled on a removed account object returns null (no misattribution aft
   assert.equal(am.setEnabled(a0, false), null, 'stale removed object resolves to null');
   assert.equal(am.accounts.every(a => a.enabled !== false), true, 'survivors untouched');
 });
+
+test('a priority change takes effect promptly even with reeval off (no timer)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5); // reevalIntervalMs 0 → no timer
+  measureAll(am);
+  am.getActiveAccount();                       // settle on a sticky current (a0, index 0)
+  const before = am.accounts[am.currentIndex].name;
+  assert.equal(before, 'a0');
+
+  am.setPriority('a1', 0);                      // make a1 strictly higher priority
+  assert.equal(am.getActiveAccount().name, 'a1', 'higher-priority account is used immediately');
+});
+
+test('a no-op preference change does not churn the sticky primary (reeval off)', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 5);
+  measureAll(am);
+  const cur = am.getActiveAccount();            // sticky current
+  am.setPriority(cur, 1);                        // current becomes highest priority — should stay
+  assert.equal(am.getActiveAccount().name, cur.name, 'no churn when current stays best');
+});
+
+test('disabling the current account re-picks immediately with reeval off', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  const cur = am.getActiveAccount();
+  am.setEnabled(cur, false);
+  const next = am.getActiveAccount();
+  assert.notEqual(next, null);
+  assert.notEqual(next.name, cur.name);
+});

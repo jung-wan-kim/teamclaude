@@ -844,6 +844,7 @@ export class AccountManager {
     // A re-enabled account has free slots — wake any request waiting in the
     // overflow queue instead of letting it time out to a 429.
     if (account.enabled) this._drainWaiters();
+    this._reprioritize();
     return account;
   }
 
@@ -856,7 +857,27 @@ export class AccountManager {
     const account = this._resolveRef(ref);
     if (!account) return null;
     account.priority = Number.isFinite(priority) ? Math.floor(priority) : null;
+    this._reprioritize();
     return account;
+  }
+
+  /**
+   * A preference change (enable/disable/priority) should take effect promptly,
+   * not wait out the sticky `reevalIntervalMs` window. Reset the re-eval clock so
+   * the next request re-picks in the default (timer) mode. In reeval-off mode
+   * (`reevalIntervalMs <= 0`, where the timer path never runs) re-pick now — but
+   * ONLY when the current account is no longer usable, or a strictly
+   * higher-priority account is available, so a no-op change can't churn the
+   * cache-warm sticky primary.
+   */
+  _reprioritize() {
+    this.lastEvalAt = 0;
+    if (this.reevalIntervalMs > 0) return;
+    const current = this.accounts[this.currentIndex];
+    const best = this._selectBest();
+    if (best && (!this._isAvailable(current) || this._priority(best) < this._priority(current))) {
+      this.currentIndex = best.index;
+    }
   }
 
   /**
