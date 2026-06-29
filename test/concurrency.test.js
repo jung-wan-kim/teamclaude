@@ -912,3 +912,20 @@ test('disabling the current account re-picks immediately with reeval off', () =>
   assert.notEqual(next, null);
   assert.notEqual(next.name, cur.name);
 });
+
+test('a no-op preference change does not churn the sticky primary (default timer mode)', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 5 * 60 * 1000, 5); // 5-min reeval
+  measureAll(am);
+  const cur = am.getActiveAccount();            // settle sticky primary
+  am.setPriority('a0', null);                    // no-op (a0 already had null priority)
+  assert.equal(am.getActiveAccount().name, cur.name, 'sticky primary unchanged on no-op (no tie round-robin churn)');
+});
+
+test('a real higher-priority change switches immediately in default timer mode', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 5 * 60 * 1000, 5);
+  measureAll(am);
+  const cur = am.getActiveAccount();
+  const other = am.accounts.find(a => a.name !== cur.name);
+  am.setPriority(other, 0);                       // strictly higher priority than current (null)
+  assert.equal(am.getActiveAccount().name, other.name, 'switches to the newly-preferred account without waiting for the timer');
+});

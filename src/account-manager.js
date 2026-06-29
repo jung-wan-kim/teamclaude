@@ -863,21 +863,23 @@ export class AccountManager {
 
   /**
    * A preference change (enable/disable/priority) should take effect promptly,
-   * not wait out the sticky `reevalIntervalMs` window. Reset the re-eval clock so
-   * the next request re-picks in the default (timer) mode. In reeval-off mode
-   * (`reevalIntervalMs <= 0`, where the timer path never runs) re-pick now — but
-   * ONLY when the current account is no longer usable, or a strictly
-   * higher-priority account is available, so a no-op change can't churn the
-   * cache-warm sticky primary.
+   * not wait out the sticky `reevalIntervalMs` window (and not at all when the
+   * timer is off). Re-pick the active account *directly* here — in either mode —
+   * but ONLY when it actually matters: the current account is no longer usable
+   * (e.g. just disabled), or a strictly higher-priority account is available.
+   *
+   * A no-op change (or one that doesn't dethrone the current account) leaves the
+   * sticky primary untouched, so it can't churn cache locality. We deliberately
+   * do NOT reset `lastEvalAt` to 0 — that would wake the periodic timer re-eval,
+   * whose tie round-robin would switch the primary even when nothing changed.
    */
   _reprioritize() {
-    this.lastEvalAt = 0;
-    if (this.reevalIntervalMs > 0) return;
     const current = this.accounts[this.currentIndex];
     const best = this._selectBest();
-    if (best && (!this._isAvailable(current) || this._priority(best) < this._priority(current))) {
-      this.currentIndex = best.index;
-    }
+    if (!best || best.index === this.currentIndex) return;
+    if (this._isAvailable(current) && this._priority(best) >= this._priority(current)) return;
+    this.currentIndex = best.index;
+    this.lastEvalAt = Date.now(); // just evaluated — don't also trigger a timer re-eval
   }
 
   /**
