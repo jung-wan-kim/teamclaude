@@ -729,3 +729,139 @@ test('global admission cap rejects past capacity before buffering (upstream unto
   upstream.close();
   proxy.close();
 });
+
+// ── disable / enable + priority (account on-off switch + selection order) ──────
+
+test('a disabled account is excluded from acquire selection', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 10); // cap 10 > the 6 acquires below
+  measureAll(am);
+  am.setEnabled('a0', false);
+
+  const picks = [];
+  for (let i = 0; i < 6; i++) picks.push((await am.acquireAccount(null, 0)).name);
+  assert.equal(picks.every(n => n === 'a1'), true, 'all requests route to the enabled account only');
+  assert.equal(am.accounts.find(a => a.name === 'a0').inflight, 0, 'disabled account took no requests');
+});
+
+test('disabling the current account switches getActiveAccount to another', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  const before = am.getActiveAccount();
+  am.setEnabled(before, false);
+  const after = am.getActiveAccount();
+  assert.notEqual(after, null);
+  assert.notEqual(after.name, before.name, 'must move off the disabled current account');
+  assert.equal(after.enabled !== false, true);
+});
+
+test('disabling every account yields null (client gets 429)', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  am.setEnabled('a0', false);
+  am.setEnabled('a1', false);
+  assert.equal(am.getActiveAccount(), null);
+  assert.equal(await am.acquireAccount(null, 0), null);
+});
+
+test('an in-flight request on an account that gets disabled still drains its slot', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  const held = await am.acquireAccount(null, 0);
+  assert.equal(held.inflight, 1);
+  am.setEnabled(held, false);                 // disable while a request is in flight
+  assert.equal(held.inflight, 1, 'disabling does not kill the in-flight request');
+  am.releaseAccount(held);
+  assert.equal(held.inflight, 0, 'slot released normally after the request finishes');
+});
+
+test('re-enabling an account hands its freed capacity to a queued waiter', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 1); // cap 1/account
+  measureAll(am);
+  am.setEnabled('a1', false);                 // only a0 usable
+
+  const a0 = await am.acquireAccount(null, 1000);
+  assert.equal(a0.name, 'a0');                // a0 now capped (cap 1)
+
+  let resolved = false;
+  const pending = am.acquireAccount(null, 1000).then(a => { resolved = true; return a; });
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(resolved, false, 'queued while a0 is capped and a1 disabled');
+
+  am.setEnabled('a1', true);                  // re-enable → drainWaiters → waiter wakes on a1
+  const got = await pending;
+  assert.equal(resolved, true);
+  assert.equal(got.name, 'a1', 'the re-enabled account served the waiting request');
+});
+
+test('a disabled account is never a warm-up target', async () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 5); // none measured yet
+  am.setEnabled('a1', false);
+  const warmed = new Set();
+  for (let i = 0; i < 10; i++) {
+    const a = am._nextWarmup();
+    if (!a) break;
+    warmed.add(a.name);
+  }
+  assert.equal(warmed.has('a1'), false, 'disabled account is not warmed up');
+});
+
+test('explicit priority drives selection order (lower = preferred); use-or-lose breaks ties', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 5);
+  measureAll(am);                              // equal reset + util → priority decides
+  am.setPriority('a0', 3);
+  am.setPriority('a1', 1);
+  am.setPriority('a2', 2);
+
+  assert.equal(am._selectBest().name, 'a1', 'priority 1 chosen first');
+  const exA1 = new Set([am.accounts.find(a => a.name === 'a1')]);
+  assert.equal(am._selectBest(exA1).name, 'a2', 'priority 2 next when 1 excluded');
+  const exA1A2 = new Set([am.accounts.find(a => a.name === 'a1'), am.accounts.find(a => a.name === 'a2')]);
+  assert.equal(am._selectBest(exA1A2).name, 'a0', 'priority 3 last');
+});
+
+test('with no priorities set, selection is unchanged use-or-lose (soonest reset first)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  // a1 resets sooner than a0 → use-or-lose prefers a1
+  const now = Date.now();
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 2 * HOUR) / 1000)) });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 1 * HOUR) / 1000)) });
+  assert.equal(am._selectBest().name, 'a1', 'soonest-resetting account preferred when no priority set');
+});
+
+test('priority ties fall back to use-or-lose (soonest reset)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  const now = Date.now();
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 2 * HOUR) / 1000)) });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 1 * HOUR) / 1000)) });
+  am.setPriority('a0', 5);
+  am.setPriority('a1', 5);                     // same priority → soonest reset (a1) wins
+  assert.equal(am._selectBest().name, 'a1');
+});
+
+test('getStatus exposes enabled + priority; setters resolve by name', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
+  measureAll(am);
+  assert.equal(am.setEnabled('a0', false)?.name, 'a0', 'setEnabled resolves by name');
+  assert.equal(am.setPriority('a1', 7)?.name, 'a1', 'setPriority resolves by name');
+  assert.equal(am.setEnabled('nope', false), null, 'unknown name → null');
+
+  const st = am.getStatus();
+  const s0 = st.accounts.find(a => a.name === 'a0');
+  const s1 = st.accounts.find(a => a.name === 'a1');
+  assert.equal(s0.enabled, false);
+  assert.equal(s0.priority, null);
+  assert.equal(s1.enabled, true);
+  assert.equal(s1.priority, 7);
+});
+
+test('enabled + priority survive a getStatus round-trip from config-style input', () => {
+  const am = new AccountManager([
+    { name: 'a0', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR, enabled: false, priority: 2 },
+    { name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR },
+  ], 0.98, 0, 5);
+  const st = am.getStatus();
+  assert.equal(st.accounts[0].enabled, false, 'enabled:false honored from constructor input');
+  assert.equal(st.accounts[0].priority, 2, 'priority honored from constructor input');
+  assert.equal(st.accounts[1].enabled, true, 'default enabled when unset');
+  assert.equal(st.accounts[1].priority, null, 'default null priority when unset');
+});

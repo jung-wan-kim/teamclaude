@@ -232,6 +232,9 @@ export class TUI {
     else if (k === 'd' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
     }
+    else if (k === 'e' && this.am.accounts.length > 0) {
+      this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex;
+    }
     else if (k === 'a') { this.mode = 'add'; }
     else if (k === 'R') { this._doSync(); }
   }
@@ -244,6 +247,8 @@ export class TUI {
       if (this.selAction === 'switch') {
         this.am.currentIndex = this.selIdx;
         this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
+      } else if (this.selAction === 'toggle') {
+        this._doToggleEnabled(this.selIdx);
       } else {
         this._doRemove(this.selIdx);
       }
@@ -369,6 +374,18 @@ export class TUI {
     this._addLog(`Deleted account "${name}"`);
   }
 
+  async _doToggleEnabled(idx) {
+    const amAcct = this.am.accounts[idx];
+    if (!amAcct) return;
+    const newEnabled = amAcct.enabled === false; // currently disabled → enable, else disable
+    // Mutate the live AccountManager (excludes/includes it in rotation, drains
+    // waiters on enable) AND the config copy so saveConfig persists the flag.
+    this.am.setEnabled(amAcct, newEnabled);
+    if (this.config.accounts[idx]) this.config.accounts[idx].enabled = newEnabled;
+    await this.saveConfig(this.config);
+    this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
+  }
+
   // ── rendering ──────────────────────────────────────
 
   render() {
@@ -463,14 +480,19 @@ export class TUI {
     // Type
     const type = gray(a.type.padEnd(7));
 
-    // Status
+    // Status — a manually-disabled account reads "disabled" regardless of its
+    // underlying quota status, since it's out of rotation either way.
     let status;
-    switch (a.status) {
-      case 'active':    status = isCur ? green('active') : 'active'; break;
-      case 'throttled': status = yellow('throttled'); break;
-      case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red('error'); break;
-      default:          status = a.status || 'ready';
+    if (a.enabled === false) {
+      status = gray('disabled');
+    } else {
+      switch (a.status) {
+        case 'active':    status = isCur ? green('active') : 'active'; break;
+        case 'throttled': status = yellow('throttled'); break;
+        case 'exhausted': status = red('exhausted'); break;
+        case 'error':     status = red('error'); break;
+        default:          status = a.status || 'ready';
+      }
     }
     status = rpad(status, 10);
 
@@ -501,15 +523,20 @@ export class TUI {
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
+    // Explicit selection priority marker (appended at the end so it never
+    // disrupts the fixed-width columns / quota bars).
+    if (a.priority != null) line += `  ${dim('P' + a.priority)}`;
     return line;
   }
 
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('d')}elete  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('d')}elete  ${bold('e')}nable/disable  ${bold('R')}eload  ${bold('q')}uit`;
       case 'select': {
-        const act = this.selAction === 'switch' ? 'switch' : 'delete';
+        const act = this.selAction === 'switch' ? 'switch'
+          : this.selAction === 'toggle' ? 'enable/disable'
+            : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'add':

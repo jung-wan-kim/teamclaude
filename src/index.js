@@ -50,6 +50,18 @@ switch (command) {
     await removeCommand();
     process.exit(0);
     break;
+  case 'disable':
+    await setEnabledCommand(false);
+    process.exit(0);
+    break;
+  case 'enable':
+    await setEnabledCommand(true);
+    process.exit(0);
+    break;
+  case 'priority':
+    await setPriorityCommand();
+    process.exit(0);
+    break;
   case 'api':
     await apiCommand();
     process.exit(0);
@@ -605,8 +617,10 @@ async function statusCommand() {
       const q = acct.quota;
       const current = acct.name === data.currentAccount ? ' *' : '';
 
-      console.log(`  ${acct.name} (${acct.type})${current}`);
-      console.log(`    Status:   ${acct.status}`);
+      const disabledTag = acct.enabled === false ? ' [disabled]' : '';
+      console.log(`  ${acct.name} (${acct.type})${current}${disabledTag}`);
+      console.log(`    Status:   ${acct.status}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
+      if (acct.priority != null) console.log(`    Priority: ${acct.priority} (lower = preferred)`);
       if (acct.maxConcurrent != null) {
         console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
       }
@@ -807,6 +821,61 @@ async function removeCommand() {
   console.log(`Removed account "${name}"`);
 }
 
+// ── enable / disable / priority ─────────────────────────────
+
+/** Note that changes apply to a running server only after a reload/restart. */
+function noteRunningServerReload(config) {
+  return findRunningServer(config).then(running => {
+    if (running) {
+      console.log('A server is running — apply now with: teamclaude restart');
+      console.log('  (or press "R" in the TUI to reload from config).');
+    }
+  }).catch(() => {});
+}
+
+async function setEnabledCommand(enabled) {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+  if (!name) {
+    console.error(`Usage: teamclaude ${enabled ? 'enable' : 'disable'} <account-name>`);
+    process.exit(1);
+  }
+  const idx = config.accounts.findIndex(a => a.name === name);
+  if (idx < 0) { console.error(`Account "${name}" not found`); process.exit(1); }
+
+  config.accounts[idx].enabled = enabled;
+  await saveConfig(config);
+  console.log(`${enabled ? 'Enabled' : 'Disabled'} account "${name}"`);
+  if (!enabled) console.log('  (excluded from active rotation; in-flight requests still finish)');
+  await noteRunningServerReload(config);
+}
+
+async function setPriorityCommand() {
+  const config = await loadOrCreateConfig();
+  const name = args[1];
+  const raw = args[2];
+  if (!name || raw === undefined) {
+    console.error('Usage: teamclaude priority <account-name> <number|clear>');
+    console.error('  Lower number = preferred first. Use "clear" to remove the priority.');
+    process.exit(1);
+  }
+  const idx = config.accounts.findIndex(a => a.name === name);
+  if (idx < 0) { console.error(`Account "${name}" not found`); process.exit(1); }
+
+  if (raw === 'clear' || raw === 'none' || raw === 'null') {
+    delete config.accounts[idx].priority;
+    await saveConfig(config);
+    console.log(`Cleared priority for "${name}" (back to use-or-lose ordering)`);
+  } else {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) { console.error(`Invalid priority "${raw}" — expected a number or "clear"`); process.exit(1); }
+    config.accounts[idx].priority = Math.floor(n);
+    await saveConfig(config);
+    console.log(`Set priority of "${name}" to ${Math.floor(n)} (lower = preferred first)`);
+  }
+  await noteRunningServerReload(config);
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -826,6 +895,9 @@ Commands:
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account
+  disable <name>      Disable an account (excluded from rotation)
+  enable <name>       Re-enable a disabled account
+  priority <name> <n> Set selection priority (lower = preferred; "clear" to reset)
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 
@@ -946,6 +1018,15 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     );
     if (!mgr) continue;
 
+    // Apply enable/disable + priority from disk (e.g. set by `teamclaude
+    // disable/enable/priority` while the server runs). setEnabled drains the
+    // overflow queue when re-enabling so a freed-up account is used immediately.
+    if (mgr.enabled !== (diskAcct.enabled !== false)) {
+      accountManager.setEnabled(mgr, diskAcct.enabled !== false);
+    }
+    const diskPriority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
+    if (mgr.priority !== diskPriority) accountManager.setPriority(mgr, diskPriority);
+
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
         mgr.refreshToken !== freshCred.refreshToken;
@@ -975,7 +1056,7 @@ async function resolveAccounts(config) {
       if (acct.importFrom) {
         try {
           const creds = await importCredentials(acct.importFrom);
-          accounts.push({ name: acct.name, type: 'oauth', maxConcurrent: acct.maxConcurrent, ...creds });
+          accounts.push({ name: acct.name, type: 'oauth', maxConcurrent: acct.maxConcurrent, enabled: acct.enabled, priority: acct.priority, ...creds });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);

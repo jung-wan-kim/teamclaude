@@ -39,6 +39,15 @@ export class AccountManager {
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
+      // Manual on/off switch. A disabled account is excluded from ALL rotation
+      // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
+      // in-flight requests still drain, but no new request is routed to it.
+      // Defaults to enabled; only an explicit `enabled: false` disables it.
+      enabled: acct.enabled !== false,
+      // Explicit selection priority: lower number = preferred first. Null/unset
+      // means "no preference" — selection then falls back to use-or-lose. So a
+      // config with no priorities behaves exactly as before.
+      priority: Number.isFinite(acct.priority) ? Math.floor(acct.priority) : null,
       quota: emptyQuota(),
       usage: {
         totalInputTokens: 0,
@@ -392,22 +401,39 @@ export class AccountManager {
     if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
 
     eligible.sort((a, b) => {
+      const pa = this._priority(a);
+      const pb = this._priority(b);
+      if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
       const ra = this._sessionResetTime(a);
       const rb = this._sessionResetTime(b);
-      if (ra !== rb) return ra - rb;                                     // soonest reset first
+      if (ra !== rb) return ra - rb;                                     // then soonest reset
       return this._sessionUtilization(a) - this._sessionUtilization(b);  // then least used
     });
 
-    // Accounts tied for the best rank (notably all-unknown at cold start) are
-    // load-balanced round-robin instead of always pinning to the lowest index,
-    // so a startup burst can't pile onto one account before quotas are known.
+    // Accounts tied for the best rank (notably all-unknown at cold start, or all
+    // sharing one priority) are load-balanced round-robin instead of always
+    // pinning to the lowest index, so a startup burst can't pile onto one account
+    // before quotas are known.
+    const p0 = this._priority(eligible[0]);
     const r0 = this._sessionResetTime(eligible[0]);
     const u0 = this._sessionUtilization(eligible[0]);
     const tied = eligible
-      .filter(a => this._sessionResetTime(a) === r0 && this._sessionUtilization(a) === u0)
+      .filter(a => this._priority(a) === p0
+        && this._sessionResetTime(a) === r0
+        && this._sessionUtilization(a) === u0)
       .sort((a, b) => a.index - b.index);
     if (tied.length <= 1) return eligible[0];
     return tied.find(a => a.index > this.currentIndex) || tied[0];
+  }
+
+  /**
+   * Explicit selection priority: lower = preferred. Unset (null) sorts last
+   * (MAX_SAFE_INTEGER) so accounts WITH a priority are chosen ahead of those
+   * without. When no account sets a priority, every account ties here and the
+   * sort falls through to use-or-lose — i.e. the original behavior unchanged.
+   */
+  _priority(account) {
+    return Number.isFinite(account.priority) ? account.priority : Number.MAX_SAFE_INTEGER;
   }
 
   /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */
@@ -486,6 +512,13 @@ export class AccountManager {
   _isAvailable(account) {
     if (!account) return false;
 
+    // Manually disabled accounts are out of rotation entirely. This single gate
+    // covers every selection path (warm-up target, _selectBest, _cappedSet,
+    // anyUsable/anyCapped, the sticky-current check) so a disabled account is
+    // never chosen for a new request. _recoverSoonest iterates accounts directly
+    // (not via this), so it skips disabled accounts itself.
+    if (account.enabled === false) return false;
+
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
       if (Date.now() < account.rateLimitedUntil) return false;
@@ -550,6 +583,8 @@ export class AccountManager {
     let soonestTime = Infinity;
 
     for (const account of this.accounts) {
+      // Never recover a manually-disabled account into rotation.
+      if (account.enabled === false) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -750,6 +785,8 @@ export class AccountManager {
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',
+      enabled: acctData.enabled !== false,
+      priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
@@ -778,6 +815,46 @@ export class AccountManager {
   }
 
   /**
+   * Resolve a caller-facing account reference — an account object, a numeric
+   * index, or a name string — to the live account object (or null). Used by the
+   * public setEnabled/setPriority so callers can name an account.
+   */
+  _resolveRef(ref) {
+    if (typeof ref === 'number') return this.accounts[ref] || null;
+    if (typeof ref === 'string') return this.accounts.find(a => a.name === ref) || null;
+    if (ref && typeof ref === 'object') return this.accounts.includes(ref) ? ref : null;
+    return null;
+  }
+
+  /**
+   * Enable or disable an account at runtime. A disabled account is excluded from
+   * rotation (via _isAvailable) but keeps any in-flight requests until they
+   * finish. Re-enabling hands its now-free capacity to any queued waiters.
+   * Returns the affected account, or null if `ref` matched nothing.
+   */
+  setEnabled(ref, enabled) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    account.enabled = enabled !== false;
+    // A re-enabled account has free slots — wake any request waiting in the
+    // overflow queue instead of letting it time out to a 429.
+    if (account.enabled) this._drainWaiters();
+    return account;
+  }
+
+  /**
+   * Set (or clear) an account's explicit selection priority. Lower number =
+   * preferred first; pass null/undefined/NaN to clear it (back to use-or-lose).
+   * Returns the affected account, or null if `ref` matched nothing.
+   */
+  setPriority(ref, priority) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    account.priority = Number.isFinite(priority) ? Math.floor(priority) : null;
+    return account;
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
@@ -788,6 +865,8 @@ export class AccountManager {
         name: a.name,
         type: a.type,
         status: a.status,
+        enabled: a.enabled !== false,
+        priority: a.priority ?? null,
         quota: { ...a.quota },
         usage: { ...a.usage },
         inflight: a.inflight,
