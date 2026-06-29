@@ -391,8 +391,10 @@ export class TUI {
     // 1:1 onto config.accounts. Matching by UUID/name avoids corrupting a
     // different config entry.
     this.am.setEnabled(amAcct, newEnabled);
-    const cfg = this.config.accounts.find(a =>
-      (amAcct.accountUuid && a.accountUuid === amAcct.accountUuid) || a.name === amAcct.name);
+    // Match the config entry UUID-first, then name — an OR match could persist the
+    // flag onto the wrong entry when a UUID and a name resolve to different accounts.
+    const cfg = (amAcct.accountUuid && this.config.accounts.find(a => a.accountUuid === amAcct.accountUuid))
+      || this.config.accounts.find(a => a.name === amAcct.name);
     if (cfg) cfg.enabled = newEnabled;
     await this.saveConfig(this.config);
     this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
