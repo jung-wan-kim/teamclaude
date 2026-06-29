@@ -929,3 +929,17 @@ test('a real higher-priority change switches immediately in default timer mode',
   am.setPriority(other, 0);                       // strictly higher priority than current (null)
   assert.equal(am.getActiveAccount().name, other.name, 'switches to the newly-preferred account without waiting for the timer');
 });
+
+test('clearing a priority restores use-or-lose routing immediately (reeval off)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 5); // reeval off
+  const now = Date.now();
+  // a0 resets later than a1 → use-or-lose prefers a1 once priorities are equal.
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 2 * HOUR) / 1000)) });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 1 * HOUR) / 1000)) });
+
+  am.setPriority('a0', 0);                      // force a0 to the front
+  assert.equal(am.getActiveAccount().name, 'a0');
+
+  am.setPriority('a0', null);                   // clear it → both equal priority
+  assert.equal(am.getActiveAccount().name, 'a1', 'use-or-lose (soonest reset) restored after clear');
+});

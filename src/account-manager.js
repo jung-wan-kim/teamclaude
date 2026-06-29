@@ -877,9 +877,28 @@ export class AccountManager {
     const current = this.accounts[this.currentIndex];
     const best = this._selectBest();
     if (!best || best.index === this.currentIndex) return;
-    if (this._isAvailable(current) && this._priority(best) >= this._priority(current)) return;
+    // Switch only when `best` is *strictly* preferred over the current account by
+    // the full selection order (priority → soonest reset → least used), or the
+    // current account is unusable. Comparing the full order — not priority alone —
+    // means clearing a priority correctly restores use-or-lose routing, while a
+    // true tie (best ranks equal to current) still leaves the sticky primary put
+    // so there's no cache-churn.
+    if (this._isAvailable(current) && !this._strictlyPrefer(best, current)) return;
     this.currentIndex = best.index;
     this.lastEvalAt = Date.now(); // just evaluated — don't also trigger a timer re-eval
+  }
+
+  /**
+   * Is account `a` strictly preferred over `b` by the same lexicographic order
+   * `_selectBest` sorts on: explicit priority (lower first), then soonest session
+   * reset, then lowest utilization. Returns false when they rank equal (a tie).
+   */
+  _strictlyPrefer(a, b) {
+    const pa = this._priority(a), pb = this._priority(b);
+    if (pa !== pb) return pa < pb;
+    const ra = this._sessionResetTime(a), rb = this._sessionResetTime(b);
+    if (ra !== rb) return ra < rb;
+    return this._sessionUtilization(a) < this._sessionUtilization(b);
   }
 
   /**
