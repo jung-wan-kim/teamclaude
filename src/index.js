@@ -949,6 +949,11 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
 
   if (idx >= 0) {
+    // Re-credentialing an existing account must not wipe its manual routing
+    // settings — carry enabled/priority over from the entry being replaced.
+    const prev = config.accounts[idx];
+    if (prev.enabled !== undefined) account.enabled = prev.enabled;
+    if (prev.priority !== undefined) account.priority = prev.priority;
     config.accounts[idx] = account;
     console.log(`Updated account "${name}"`);
   } else {

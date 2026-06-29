@@ -331,6 +331,12 @@ export class TUI {
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
       if (idx >= 0) {
+        // Preserve manual routing settings across a re-import (the new entry
+        // omits them, so a re-import would otherwise re-enable a disabled
+        // account / clear its priority).
+        const prev = this.config.accounts[idx];
+        if (prev.enabled !== undefined) entry.enabled = prev.enabled;
+        if (prev.priority !== undefined) entry.priority = prev.priority;
         this.config.accounts[idx] = entry;
         // Update the running account manager entry
         const amAcct = this.am.accounts[idx];
