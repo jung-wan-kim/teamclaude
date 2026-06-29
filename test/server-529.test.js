@@ -12,6 +12,7 @@ function startProxy(am, upstreamPort) {
   return createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false, // isolate 529 failover from background warm-up probes
   });
 }
 

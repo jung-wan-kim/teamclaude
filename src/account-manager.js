@@ -536,6 +536,27 @@ export class AccountManager {
     return null;
   }
 
+  /**
+   * Accounts eligible for an *active* warm-up probe: available (enabled, not
+   * throttled / exhausted / error), with no quota data yet, AND not already
+   * handling a request. The server sends each one a minimal upstream request to
+   * populate its quota so the dashboard reflects the whole fleet shortly after a
+   * (re)start, instead of waiting for client traffic to organically reach every
+   * account.
+   *
+   * `inflight === 0` matters: a request already in flight will itself populate
+   * the account's quota (updateQuota runs on its response headers), so probing it
+   * would just race that request and waste an upstream call. Cold start's very
+   * first request holds its (still-unmeasured) account here, so the startup
+   * fan-out probes only the genuinely idle rest of the fleet — never the account
+   * that request is already measuring. (An unmeasured account can't be near-quota,
+   * so no extra status carve-outs are needed beyond _isAvailable.)
+   */
+  warmupCandidates() {
+    return this.accounts.filter(a =>
+      this._isAvailable(a) && !this._isMeasured(a) && a.inflight === 0);
+  }
+
   _isAvailable(account) {
     if (!account) return false;
 

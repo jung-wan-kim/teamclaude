@@ -35,6 +35,7 @@ test('a 401 marks the account error and switches, without repeated 401s', async 
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false, // isolate 401 failover from background warm-up probes
   });
   const proxyPort = await listen(proxy);
 
@@ -72,6 +73,7 @@ test('all accounts failing auth → returns 401 to the client', async () => {
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false, // isolate 401 failover from background warm-up probes
   });
   const proxyPort = await listen(proxy);
 

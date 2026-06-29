@@ -1,0 +1,307 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+
+const HOUR = 3600_000;
+
+function makeAccounts(n) {
+  return Array.from({ length: n }, (_, i) => ({
+    name: `a${i}`, type: 'oauth', accessToken: `tok-${i}`, refreshToken: 'r', expiresAt: Date.now() + HOUR,
+  }));
+}
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+// Poll a predicate until true or the budget runs out (warm-up is async/background).
+async function waitFor(cond, ms = 2000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (cond()) return true;
+    await new Promise(r => setTimeout(r, 15));
+  }
+  return cond();
+}
+
+const RL_HEADERS = () => ({
+  'content-type': 'application/json',
+  'anthropic-ratelimit-unified-5h-utilization': '0.1',
+  'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+});
+
+// An upstream that records each request (auth, beta header, body) and answers
+// every POST with rate-limit headers so the account becomes "measured".
+function recordingUpstream(seen) {
+  return http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    seen.push({ auth: req.headers['authorization'], beta: req.headers['anthropic-beta'], body: raw });
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+}
+
+function measured(am, name) {
+  return am.getStatus().accounts.find(a => a.name === name)?.quota.unified5h != null;
+}
+
+// ── unit: warmupCandidates() ───────────────────────────────────────────────
+
+test('warmupCandidates returns only available + unmeasured + idle accounts', () => {
+  const am = new AccountManager(makeAccounts(5), 0.98, 0, 3);
+  // a0 measured
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+  // a1 unmeasured + idle → the only candidate
+  // a2 disabled
+  am.setEnabled(am.accounts[2], false);
+  // a3 throttled (rate-limited into the future)
+  am.markRateLimited(3, 300);
+  // a4 unmeasured but a request is in flight → excluded (that request will measure it)
+  am.accounts[4].inflight = 1;
+
+  const names = am.warmupCandidates().map(a => a.name);
+  assert.deepEqual(names, ['a1'], 'only the idle, unmeasured, enabled account is a candidate');
+});
+
+// ── integration: startup fan-out ───────────────────────────────────────────
+
+test('the first real request triggers a fan-out that measures the rest of the fleet', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0, // startup fan-out only — isolate it from the periodic timer
+  });
+  const port = await listen(proxy);
+
+  // One genuine /v1/messages: routes to a0 (warm-up cursor) AND captures the template.
+  const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20' },
+    body: JSON.stringify({ model: 'claude-x', system: 'You are Claude Code', messages: [{ role: 'user', content: 'real' }] }),
+  });
+  assert.equal(r.status, 200);
+
+  // The fan-out probes the other two accounts → all three measured.
+  assert.ok(await waitFor(() => seen.length === 3), `expected 3 upstream hits, got ${seen.length}`);
+  assert.ok(await waitFor(() => ['a0', 'a1', 'a2'].every(n => measured(am, n))), 'whole fleet measured');
+
+  // Exactly one hit per account (1 real + 2 probes), each with its own bearer token.
+  const tokens = new Set(seen.map(s => s.auth));
+  assert.deepEqual([...tokens].sort(), ['Bearer tok-0', 'Bearer tok-1', 'Bearer tok-2']);
+
+  // The two probes replay the captured shape: max_tokens 1, same model + system, beta header.
+  const probes = seen.filter(s => { try { return JSON.parse(s.body).messages?.[0]?.content === 'ping'; } catch { return false; } });
+  assert.equal(probes.length, 2, 'exactly two probes (a0 was measured by the real request, not re-probed)');
+  for (const p of probes) {
+    const b = JSON.parse(p.body);
+    assert.equal(b.max_tokens, 1, 'probe is minimal');
+    assert.equal(b.model, 'claude-x', 'probe reuses captured model');
+    assert.equal(b.system, 'You are Claude Code', 'probe replays captured system (OAuth requires it)');
+    assert.equal(p.beta, 'oauth-2025-04-20', 'probe carries captured anthropic-beta');
+  }
+
+  proxy.close();
+  upstream.close();
+});
+
+// ── integration: periodic warm-up ──────────────────────────────────────────
+
+test('periodic warm-up measures an account added at runtime (no client traffic)', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 50, // fast periodic for the test
+  });
+  const port = await listen(proxy);
+
+  // One request captures the template and (via the startup fan-out) measures a0+a1.
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': 'oauth-2025-04-20' },
+    body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'real' }] }),
+  });
+  assert.ok(await waitFor(() => measured(am, 'a0') && measured(am, 'a1')), 'a0+a1 measured after first request');
+
+  // Add a new account AFTER the startup fan-out — only the periodic timer can reach it.
+  am.addAccount({ name: 'a2', type: 'oauth', accessToken: 'tok-2', refreshToken: 'r', expiresAt: Date.now() + HOUR });
+  assert.ok(!measured(am, 'a2'), 'new account starts unmeasured');
+
+  assert.ok(await waitFor(() => measured(am, 'a2')), 'periodic warm-up measured the runtime-added account');
+
+  proxy.close();
+  upstream.close();
+});
+
+// ── integration: best-effort safety ────────────────────────────────────────
+
+test('a failing probe leaves the account unmeasured and never breaks the proxy', async () => {
+  const seen = [];
+  // Real requests succeed (200 + headers); probes (content "ping") get a 500 with no rate-limit headers.
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    seen.push({ auth: req.headers['authorization'], body: raw });
+    let isProbe = false;
+    try { isProbe = JSON.parse(raw).messages?.[0]?.content === 'ping'; } catch { /* not json */ }
+    if (isProbe) { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"x"}'); return; }
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  const port = await listen(proxy);
+
+  const r1 = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'real' }] }),
+  });
+  assert.equal(r1.status, 200);
+
+  // Give the (failing) probe time to run.
+  assert.ok(await waitFor(() => seen.some(s => { try { return JSON.parse(s.body).messages?.[0]?.content === 'ping'; } catch { return false; } })), 'a probe was attempted');
+  await new Promise(r => setTimeout(r, 50));
+
+  assert.ok(measured(am, 'a0'), 'the account served by the real request is measured');
+  assert.ok(!measured(am, 'a1'), 'the failed-probe account stays unmeasured (best-effort)');
+
+  // The proxy is unharmed — a subsequent request still succeeds.
+  const r2 = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'again' }] }),
+  });
+  assert.equal(r2.status, 200);
+
+  proxy.close();
+  upstream.close();
+});
+
+test('a non-exhaustion 429 probe (rate-limit headers but not "rejected") does not measure the account', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    let isProbe = false;
+    try { isProbe = JSON.parse(raw).messages?.[0]?.content === 'ping'; } catch { /* not json */ }
+    if (isProbe) {
+      // 429 WITH rate-limit headers but unified-status "allowed" → a request-rate /
+      // global limit, NOT account exhaustion. Must leave the account untouched.
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-5h-utilization': '0.5',
+        'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+        'anthropic-ratelimit-unified-status': 'allowed',
+        'retry-after': '1',
+      });
+      res.end('{"error":"rate"}');
+      return;
+    }
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const port = await listen(proxy);
+
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'real' }] }),
+  });
+  assert.ok(await waitFor(() => measured(am, 'a0')), 'a0 measured by the real request');
+  await new Promise(r => setTimeout(r, 80)); // let the (non-exhaustion 429) probe finish
+
+  const a1 = am.getStatus().accounts.find(a => a.name === 'a1');
+  assert.ok(!measured(am, 'a1'), 'non-exhaustion 429 must NOT mark the probed account measured');
+  assert.equal(a1.usage.totalRequests, 0, 'non-exhaustion 429 must not bump usage (no updateQuota)');
+  assert.equal(a1.status, 'active', 'non-exhaustion 429 must not change account status');
+
+  proxy.close();
+  upstream.close();
+});
+
+test('an in-flight probe holds no client concurrency slot (client capacity undiminished)', async () => {
+  let probeArrived = false;
+  // Real requests answer 200; a probe ("ping") HANGS (never responds), so it is
+  // genuinely in flight when we inspect capacity.
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    let isProbe = false;
+    try { isProbe = JSON.parse(raw).messages?.[0]?.content === 'ping'; } catch { /* not json */ }
+    if (isProbe) { probeArrived = true; return; } // hang — hold the probe open
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 2); // cap 2/account
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const port = await listen(proxy);
+
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'real' }] }),
+  });
+  assert.ok(await waitFor(() => probeArrived), 'a probe reached upstream and is hanging in flight');
+
+  // The hanging probe must occupy ZERO concurrency slots — the whole fleet's cap
+  // stays available to clients, so a probe can never starve / 429 client traffic.
+  const totalInflight = am.accounts.reduce((s, a) => s + a.inflight, 0);
+  assert.equal(totalInflight, 0, 'an in-flight probe reserves no client slot');
+
+  proxy.close(); // aborts the hanging probe (warmupAbort)
+  upstream.close();
+});
+
+// ── integration: master switch ─────────────────────────────────────────────
+
+test('activeWarmup:false sends no probes (only client traffic reaches upstream)', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const port = await listen(proxy);
+
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'real' }] }),
+  });
+
+  // Wait a beat to prove no background fan-out fires.
+  await new Promise(r => setTimeout(r, 150));
+  assert.equal(seen.length, 1, 'only the one client request reached upstream — no probes');
+  assert.ok(measured(am, 'a0'), 'the routed account is still measured (passive warm-up)');
+  assert.ok(!measured(am, 'a1') && !measured(am, 'a2'), 'the rest stay unmeasured (active warm-up off)');
+
+  proxy.close();
+  upstream.close();
+});

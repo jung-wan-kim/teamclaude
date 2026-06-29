@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isTokenExpiringSoon } from './oauth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -33,6 +34,174 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
+  }
+
+  // ── Active warm-up ─────────────────────────────────────────────────────────
+  // Quota is only learned from real upstream rate-limit headers (Anthropic has no
+  // "get my quota" endpoint), so a freshly (re)started proxy shows the whole fleet
+  // as "—" until client traffic happens to flow through every account. Active
+  // warm-up fixes that: it stages a request template from the first genuine
+  // /v1/messages and COMMITS it only after upstream accepts that request (2xx) —
+  // so a model/header combo upstream would reject can't seed a template that makes
+  // every probe fail. The committed template (exact model + anthropic-version +
+  // anthropic-beta + Claude-Code system) is replayed as a minimal probe
+  // (max_tokens: 1) against each still-unmeasured account to populate its quota.
+  // It fans out once the instant the template commits (right after the first
+  // post-restart request) AND periodically (config.warmupIntervalMs, default 5m;
+  // 0 = startup-only). Each probe is best-effort and side-effect-light: it never
+  // refreshes tokens or mutates account status, reserves a real cap slot so it
+  // can't push an account over maxConcurrent, and only learns from a 2xx (or an
+  // account-level quota 429). `config.activeWarmup: false` disables it all.
+  const activeWarmup = config.activeWarmup !== false;
+  const warmupIntervalMs = Number.isFinite(config.warmupIntervalMs)
+    ? Math.max(0, config.warmupIntervalMs)
+    : 5 * 60 * 1000;
+  const WARMUP_PROBE_TIMEOUT_MS = 15_000;
+  let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
+  let warmupInFlight = false; // guard against overlapping fan-outs
+  let warmupClosed = false;   // set on server close: stop scheduling, abort in-flight probes
+  const warmupAbort = new AbortController();
+
+  // Stage a candidate template from a genuine /v1/messages request WITHOUT
+  // committing — we only trust the shape once upstream has accepted it (see
+  // commitProbeTemplate). Path-exact so /v1/messages/count_tokens isn't taken for
+  // inference. Returns the candidate (or null).
+  function stageProbeTemplate(req, body) {
+    if (!activeWarmup || probeTemplate) return null;
+    if (req.method !== 'POST' || req.url.split('?')[0] !== '/v1/messages') return null;
+    let json;
+    try { json = JSON.parse(body.toString()); } catch { return null; }
+    if (!json || typeof json.model !== 'string') return null;
+    return {
+      model: json.model,
+      version: req.headers['anthropic-version'] || '2023-06-01',
+      beta: req.headers['anthropic-beta'] || null,
+      system: json.system ?? null,
+    };
+  }
+
+  // Commit a staged template once its request succeeded (2xx), then fan out so the
+  // rest of the fleet is measured within seconds of the first post-restart request.
+  function commitProbeTemplate(candidate, status) {
+    if (!activeWarmup || probeTemplate || warmupClosed) return;
+    if (!(status >= 200 && status < 300)) return; // only trust an accepted shape
+    probeTemplate = candidate;
+    setImmediate(() => { warmupUnmeasured(); });
+  }
+
+  function buildProbeBody(t) {
+    const b = { model: t.model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] };
+    if (t.system != null) b.system = t.system; // mirror the real request (OAuth requires the system prompt)
+    return JSON.stringify(b);
+  }
+
+  // A probe fetch is bounded by BOTH a timeout and server-close, so a scheduled or
+  // in-flight probe can't keep sending a credentialed request after teardown.
+  // Returns { signal, cleanup }: the caller MUST call cleanup() when the probe
+  // settles (success OR failure) so a fast probe doesn't leave its 15s timer and
+  // its warmupAbort listener dangling until the timeout fires.
+  function probeSignal() {
+    const ac = new AbortController();
+    if (warmupAbort.signal.aborted) { ac.abort(); return { signal: ac.signal, cleanup() {} }; }
+    const onClose = () => ac.abort();
+    warmupAbort.signal.addEventListener('abort', onClose, { once: true });
+    const t = setTimeout(() => ac.abort(), WARMUP_PROBE_TIMEOUT_MS);
+    t.unref?.();
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      clearTimeout(t);
+      warmupAbort.signal.removeEventListener('abort', onClose);
+    };
+    return { signal: ac.signal, cleanup };
+  }
+
+  // Probe one account: send a minimal /v1/messages with its own auth and fold the
+  // rate-limit headers into its quota. Best-effort and side-effect-light:
+  //  - Never refreshes tokens — a background refresh failure could mark the account
+  //    'error' and pull it from rotation before any real request proved auth. An
+  //    OAuth account with an expiring token is left to the client path (which has
+  //    the proper 401 → forced-refresh → error handling).
+  //  - Does NOT reserve a client concurrency slot. The hard rule is "client traffic
+  //    must not break". A probe that shared the per-account cap would inevitably
+  //    subtract one client slot, which — with the overflow queue disabled — lets
+  //    the proxy itself 429 a client when every slot is momentarily taken (no
+  //    account to fail over to). So the cap is left entirely to clients; a probe is
+  //    at most ONE extra concurrent request, and only ever on an idle, non-sticky,
+  //    unmeasured account (warmupCandidates requires inflight===0; real traffic
+  //    concentrates on the *measured* sticky account, not here). maxConcurrent is a
+  //    conservative soft cap kept under Anthropic's real per-account limit (see
+  //    CLAUDE.md, "the cap is not a hard binding"), so that transient +1 stays
+  //    safe — and in the unlikely event it did cause a client rate-429, the
+  //    existing 429 failover transparently recovers it, whereas a probe-induced
+  //    capacity 429 could not.
+  //  - Learns ONLY from a response upstream accepted (2xx) or an account-level
+  //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
+  async function warmupAccount(account) {
+    if (!probeTemplate || warmupClosed || account._warming) return;
+    // Don't refresh from a background probe; skip an OAuth account that needs one.
+    if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
+    // Re-confirm it's still an available, unmeasured, idle candidate.
+    if (!accountManager.warmupCandidates().includes(account)) return;
+    account._warming = true;
+    const probe = probeSignal();
+    try {
+      const headers = { 'content-type': 'application/json', 'anthropic-version': probeTemplate.version };
+      if (probeTemplate.beta) headers['anthropic-beta'] = probeTemplate.beta;
+      if (account.type === 'oauth') headers['authorization'] = `Bearer ${account.credential}`;
+      else headers['x-api-key'] = account.credential;
+
+      const res = await fetch(`${upstream}/v1/messages`, {
+        method: 'POST', headers, body: buildProbeBody(probeTemplate), signal: probe.signal,
+      });
+      const rl = {};
+      for (const [k, v] of res.headers.entries()) {
+        if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
+      }
+      await res.body?.cancel();
+      // Learn ONLY from a response upstream accepted (2xx) or an *account-level*
+      // quota 429 — one whose `unified-status` is `rejected` (the account is
+      // genuinely over its limit). A non-exhaustion 429 (request-rate / global /
+      // transient) carries rate-limit headers too but is NOT account state;
+      // folding it in would wrongly mark the account measured/unavailable and
+      // break best-effort. updateQuota by OBJECT is reindex-safe; still skip a
+      // detached (removed-mid-fetch) account.
+      const accountExhausted429 = res.status === 429
+        && rl['anthropic-ratelimit-unified-status'] === 'rejected';
+      if ((res.ok || accountExhausted429) && Object.keys(rl).length
+          && accountManager.accounts[account.index] === account) {
+        accountManager.updateQuota(account, rl);
+        console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
+      }
+    } catch (err) {
+      // Best-effort: leave the account unmeasured (exactly as before warm-up).
+      console.error(`[TeamClaude] Warm-up probe failed for "${account.name}": ${err.message}`);
+    } finally {
+      probe.cleanup(); // clear the timeout + warmupAbort listener now (not 15s later)
+      account._warming = false;
+    }
+  }
+
+  // Probe every currently-unmeasured idle account in parallel. Guarded so two
+  // triggers (first-commit + the interval) can't run overlapping fan-outs.
+  async function warmupUnmeasured() {
+    if (!activeWarmup || warmupClosed || !probeTemplate || warmupInFlight) return;
+    warmupInFlight = true;
+    try {
+      await Promise.all(accountManager.warmupCandidates().map(a => warmupAccount(a)));
+    } finally {
+      warmupInFlight = false;
+    }
+  }
+
+  // Periodic warm-up: re-measures any account that is still unmeasured — including
+  // one whose quota window just reset (its utilization is cleared, so the
+  // dashboard reads "—" again) — without waiting for client traffic to reach it.
+  let warmupTimer = null;
+  if (activeWarmup && warmupIntervalMs > 0) {
+    warmupTimer = setInterval(() => { warmupUnmeasured(); }, warmupIntervalMs);
+    warmupTimer.unref(); // never keep the process alive just for warm-up
   }
 
   const server = http.createServer(async (req, res) => {
@@ -115,6 +284,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           }
           const body = Buffer.concat(bodyChunks);
 
+          // Stage a warm-up template from this request (no-op once committed / when
+          // warm-up is off). It's COMMITTED only after forwardRequest returns a 2xx
+          // below, so a request upstream rejects can't seed a bad template.
+          const stagedTemplate = stageProbeTemplate(req, body);
+
           // Tie an abort signal to client disconnect so a request that's only
           // WAITING in the overflow queue is cancelled if the client goes away —
           // otherwise it would acquire a slot later and be dispatched upstream,
@@ -125,6 +299,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           ctx.abortSignal = ac.signal;
           try {
             await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+            // Commit the warm-up template only after upstream accepted this request
+            // (2xx via ctx.status), then fan out to measure the rest of the fleet.
+            if (stagedTemplate) commitProbeTemplate(stagedTemplate, ctx.status);
           } finally {
             res.removeListener('close', onClose);
           }
@@ -158,6 +335,23 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       console.error('[TeamClaude] Unhandled error:', err);
     }
   });
+
+  // Shut warm-up down the instant a close is REQUESTED, not when the `'close'`
+  // event finally fires — that waits for open keep-alive connections to drain,
+  // and during that window the interval could still dispatch a credentialed
+  // probe. Wrap server.close() to run the (idempotent) shutdown synchronously;
+  // keep the `'close'` handler as a fallback for closes that bypass the method.
+  // It stops scheduling new fan-outs (warmupClosed), aborts any in-flight /
+  // scheduled probe (warmupAbort), and clears the periodic timer.
+  const shutdownWarmup = () => {
+    if (warmupClosed) return;
+    warmupClosed = true;
+    warmupAbort.abort();
+    if (warmupTimer) clearInterval(warmupTimer);
+  };
+  const closeServer = server.close.bind(server);
+  server.close = (cb) => { shutdownWarmup(); return closeServer(cb); };
+  server.on('close', shutdownWarmup);
 
   return server;
 }
