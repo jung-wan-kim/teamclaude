@@ -834,24 +834,26 @@ function noteRunningServerReload(config) {
 }
 
 async function setEnabledCommand(enabled) {
-  const config = await loadOrCreateConfig();
   const name = args[1];
   if (!name) {
     console.error(`Usage: teamclaude ${enabled ? 'enable' : 'disable'} <account-name>`);
     process.exit(1);
   }
-  const idx = config.accounts.findIndex(a => a.name === name);
-  if (idx < 0) { console.error(`Account "${name}" not found`); process.exit(1); }
-
-  config.accounts[idx].enabled = enabled;
-  await saveConfig(config);
+  // atomicConfigUpdate re-reads disk before writing, so a concurrent token
+  // refresh from the running server (or another CLI edit) isn't clobbered by a
+  // stale snapshot. Match by name (what the user typed) within the fresh copy.
+  let found = false;
+  const config = await atomicConfigUpdate(cfg => {
+    const acct = cfg.accounts.find(a => a.name === name);
+    if (acct) { acct.enabled = enabled; found = true; }
+  });
+  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
   console.log(`${enabled ? 'Enabled' : 'Disabled'} account "${name}"`);
   if (!enabled) console.log('  (excluded from active rotation; in-flight requests still finish)');
   await noteRunningServerReload(config);
 }
 
 async function setPriorityCommand() {
-  const config = await loadOrCreateConfig();
   const name = args[1];
   const raw = args[2];
   if (!name || raw === undefined) {
@@ -859,20 +861,22 @@ async function setPriorityCommand() {
     console.error('  Lower number = preferred first. Use "clear" to remove the priority.');
     process.exit(1);
   }
-  const idx = config.accounts.findIndex(a => a.name === name);
-  if (idx < 0) { console.error(`Account "${name}" not found`); process.exit(1); }
-
-  if (raw === 'clear' || raw === 'none' || raw === 'null') {
-    delete config.accounts[idx].priority;
-    await saveConfig(config);
-    console.log(`Cleared priority for "${name}" (back to use-or-lose ordering)`);
-  } else {
+  const clearing = raw === 'clear' || raw === 'none' || raw === 'null';
+  let value = null;
+  if (!clearing) {
     const n = Number(raw);
     if (!Number.isFinite(n)) { console.error(`Invalid priority "${raw}" — expected a number or "clear"`); process.exit(1); }
-    config.accounts[idx].priority = Math.floor(n);
-    await saveConfig(config);
-    console.log(`Set priority of "${name}" to ${Math.floor(n)} (lower = preferred first)`);
+    value = Math.floor(n);
   }
+  let found = false;
+  const config = await atomicConfigUpdate(cfg => {
+    const acct = cfg.accounts.find(a => a.name === name);
+    if (acct) { found = true; if (clearing) delete acct.priority; else acct.priority = value; }
+  });
+  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
+  console.log(clearing
+    ? `Cleared priority for "${name}" (back to use-or-lose ordering)`
+    : `Set priority of "${name}" to ${value} (lower = preferred first)`);
   await noteRunningServerReload(config);
 }
 
