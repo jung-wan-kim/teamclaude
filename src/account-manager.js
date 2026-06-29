@@ -393,11 +393,21 @@ export class AccountManager {
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
       const account = this._tryAcquire(waiter.exclude, waiter.affinityKey);
-      if (!account) { i++; continue; }
-      // _settleWaiter splices the waiter out, so don't advance i. If it was
-      // already settled (shouldn't happen — settled waiters aren't in the list),
-      // give the slot back instead of leaking it.
-      if (!this._settleWaiter(waiter, account)) { account.inflight--; i++; }
+      if (account) {
+        // _settleWaiter splices the waiter out, so don't advance i. If it was
+        // already settled (shouldn't happen — settled waiters aren't in the list),
+        // give the slot back instead of leaking it.
+        if (!this._settleWaiter(waiter, account)) { account.inflight--; i++; }
+        continue;
+      }
+      // No slot right now. If no account this waiter could use is even
+      // available-but-capped, nothing will ever free for it (e.g. the account it
+      // was queued for just got disabled or exhausted) — settle it null so it
+      // releases its finite queue slot instead of blocking later, satisfiable
+      // overflow requests until its timeout. A waiter that still has a cappable
+      // account to hope for is left in place.
+      if (!this.anyCapped(waiter.exclude)) { this._settleWaiter(waiter, null); continue; }
+      i++;
     }
   }
 
@@ -858,9 +868,11 @@ export class AccountManager {
     const account = this._resolveRef(ref);
     if (!account) return null;
     account.enabled = enabled !== false;
-    // A re-enabled account has free slots — wake any request waiting in the
-    // overflow queue instead of letting it time out to a 429.
-    if (account.enabled) this._drainWaiters();
+    // Re-evaluate the overflow queue either way: re-enabling hands the account's
+    // free slots to waiters; disabling may leave a waiter that could *only* be
+    // served by this account with no hope — _drainWaiters settles those now (so
+    // they release their finite queue slot) instead of stranding them to timeout.
+    this._drainWaiters();
     this._reprioritize();
     return account;
   }

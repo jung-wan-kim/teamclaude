@@ -1015,3 +1015,25 @@ test('all-unset priorities still tie (no NaN sort key) and fall through to use-o
   am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 1 * HOUR) / 1000)) });
   assert.equal(am._selectBest().name, 'a1', 'Infinity===Infinity ties → soonest reset wins, no NaN');
 });
+
+test('disabling the account a waiter needs settles that waiter instead of stranding the queue', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 1, 1); // cap 1/account, queue depth 1
+  measureAll(am);
+  const x = await am.acquireAccount(null, 0);
+  const y = await am.acquireAccount(null, 0);
+  assert.notEqual(x.name, y.name);             // both accounts now capped
+
+  // W1 can ONLY be served by x (y is excluded for it).
+  let w1done = false;
+  const w1 = am.acquireAccount(new Set([y]), 60000).then(a => { w1done = true; return a; });
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal(am._waiters.length, 1, 'W1 is queued waiting for x');
+
+  am.setEnabled(x, false);                      // disable the only account W1 could use
+  const w1res = await w1;
+  assert.equal(w1done, true, 'W1 resolved promptly, not at its 60s timeout');
+  assert.equal(w1res, null, 'unsatisfiable waiter is settled null');
+  assert.equal(am._waiters.length, 0, 'its queue slot is freed for later requests');
+
+  am.releaseAccount(x); am.releaseAccount(y);
+});
