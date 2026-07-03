@@ -637,15 +637,17 @@ export class AccountManager {
   warmupCandidates() {
     return this.accounts.filter(a =>
       this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
-      // Convergence cap for the HALF-measured re-probe path: against the real
-      // upstream one probe repopulates both windows, but a pathological 2xx
-      // that keeps omitting a header family must not be probed every interval
-      // forever. After maxWarmupTries fruitless partial probes the account is
-      // treated as measured-as-good-as-it-gets; the counter resets when a
-      // window is swept (a fresh rollover is a fresh reason to probe) or when
-      // the account becomes fully measured. Cold-start (fully UNmeasured)
-      // candidacy keeps its existing uncapped-by-count semantics.
-      && !(this._isMeasured(a) && (a._partialProbes || 0) >= this.maxWarmupTries));
+      // Convergence cap: against the real upstream one probe fully measures an
+      // account (responses always carry both window families), but a
+      // pathological upstream — a 2xx missing a family, or header-less
+      // responses — must not be probed every interval forever. A probe that
+      // completes without fully measuring the account increments
+      // _partialProbes (network failures don't count — transient); after
+      // maxWarmupTries fruitless probes the account stops being a candidate.
+      // The counter resets when a window is swept (a fresh rollover is a fresh
+      // reason to probe) or when the account becomes fully measured, so the
+      // documented "re-measure after a window reset" recovery is preserved.
+      && (a._partialProbes || 0) < this.maxWarmupTries);
   }
 
   _isAvailable(account) {

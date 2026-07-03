@@ -135,6 +135,41 @@ test('a pathological upstream that omits the 7d window stops being probed after 
   }
 });
 
+// Same cap, header-less flavor: a 2xx with NO rate-limit headers teaches
+// nothing and leaves the account fully unmeasured — it must also stop being
+// probed after the cap instead of every interval forever.
+test('a header-less 2xx upstream stops being probed after the cap', async () => {
+  const seen = [];
+  const bareUpstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    seen.push(1);
+    res.writeHead(200, { 'content-type': 'application/json' }); // no anthropic-ratelimit-*
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(bareUpstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 20 });
+  const proxyPort = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(await waitFor(() =>
+      am.accounts.every(a => (a._partialProbes || 0) >= am.maxWarmupTries)), true,
+      'fruitless header-less probes accumulated to the cap');
+    assert.deepEqual(am.warmupCandidates(), [], 'capped accounts no longer probed');
+    assert.equal(measured(am, 'a1'), false, 'account honestly stays unmeasured');
+    const count = seen.length;
+    await new Promise(r => setTimeout(r, 150));
+    assert.equal(seen.length, count, 'no further probes after the cap');
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => bareUpstream.close(r));
+  }
+});
+
 // ── unit: the periodic timer sweeps rolled-over windows on an idle proxy ────
 
 test('the periodic warm-up timer sweeps rolled-over windows even with no traffic', async () => {

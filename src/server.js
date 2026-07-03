@@ -172,12 +172,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if ((res.ok || accountExhausted429) && Object.keys(rl).length
           && accountManager.accounts[account.index] === account) {
         accountManager.updateQuota(account, rl);
-        // Track fruitless PARTIAL probes: a response that leaves the account
-        // half-measured (one window family still missing) counts toward the
-        // convergence cap in warmupCandidates; a full measurement resets it.
+        // Convergence accounting: a probe that leaves the account fully
+        // measured resets the fruitless-probe counter; one that leaves it
+        // half-measured (a header family missing) counts toward the cap.
         if (accountManager._fullyMeasured(account)) account._partialProbes = 0;
-        else if (accountManager._isMeasured(account)) account._partialProbes = (account._partialProbes || 0) + 1;
+        else account._partialProbes = (account._partialProbes || 0) + 1;
         console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
+      } else if (accountManager.accounts[account.index] === account) {
+        // The probe COMPLETED but taught nothing — a header-less 2xx, or a
+        // non-exhaustion error status. Count it toward the convergence cap so
+        // a pathological upstream is not probed every interval forever.
+        // Network failures (the catch below) stay uncounted: they are
+        // transient and must not burn the retry budget.
+        account._partialProbes = (account._partialProbes || 0) + 1;
       }
     } catch (err) {
       // Best-effort: leave the account unmeasured (exactly as before warm-up).
