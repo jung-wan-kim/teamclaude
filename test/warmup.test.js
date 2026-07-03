@@ -90,6 +90,51 @@ test('a partially-measured OAuth account (weekly swept, session alive) is re-pro
     'half-measured account is a warm-up candidate again');
 });
 
+// Regression (review finding): the half-measured re-probe path needs a
+// convergence cap — a pathological upstream that keeps answering 2xx with only
+// one header family must not be probed every interval forever.
+test('a pathological upstream that omits the 7d window stops being probed after the cap', async () => {
+  const seen = [];
+  const halfUpstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    seen.push(1);
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+      // no 7d family — accounts stay half-measured no matter how often probed
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(halfUpstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 20 });
+  const proxyPort = await listen(proxy);
+  try {
+    // A real client request (2xx) commits the probe template and starts the fan-out.
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    // Both accounts end up half-measured; probes must stop once each hits the cap.
+    assert.equal(await waitFor(() =>
+      am.accounts.every(a => (a._partialProbes || 0) >= am.maxWarmupTries)), true,
+      'each account accumulated its capped partial probes');
+    assert.deepEqual(am.warmupCandidates(), [], 'capped accounts are no longer candidates');
+    const count = seen.length;
+    await new Promise(r => setTimeout(r, 150));   // several more intervals
+    assert.equal(seen.length, count, 'no further probes after the cap');
+    // A rollover sweep re-opens candidacy (fresh reason to probe).
+    am.accounts[0].quota.unified5hReset = Date.now() - 1000;
+    am.sweepExpired();
+    assert.equal(am.accounts[0]._partialProbes, 0, 'sweep reset the counter');
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => halfUpstream.close(r));
+  }
+});
+
 // ── unit: the periodic timer sweeps rolled-over windows on an idle proxy ────
 
 test('the periodic warm-up timer sweeps rolled-over windows even with no traffic', async () => {

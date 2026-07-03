@@ -636,7 +636,16 @@ export class AccountManager {
    */
   warmupCandidates() {
     return this.accounts.filter(a =>
-      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0);
+      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
+      // Convergence cap for the HALF-measured re-probe path: against the real
+      // upstream one probe repopulates both windows, but a pathological 2xx
+      // that keeps omitting a header family must not be probed every interval
+      // forever. After maxWarmupTries fruitless partial probes the account is
+      // treated as measured-as-good-as-it-gets; the counter resets when a
+      // window is swept (a fresh rollover is a fresh reason to probe) or when
+      // the account becomes fully measured. Cold-start (fully UNmeasured)
+      // candidacy keeps its existing uncapped-by-count semantics.
+      && !(this._isMeasured(a) && (a._partialProbes || 0) >= this.maxWarmupTries));
   }
 
   _isAvailable(account) {
@@ -675,12 +684,14 @@ export class AccountManager {
       if (q.unified5h != null) console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      account._partialProbes = 0; // fresh rollover → half-measured re-probes allowed again
     }
     if (q.unified7dReset && now >= q.unified7dReset) {
       if (q.unified7d != null) console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
+      account._partialProbes = 0; // fresh rollover → half-measured re-probes allowed again
     }
     // Clear expired model-scoped weekly windows (display-only, but a stale
     // "94% Fable" bar after the window reset would mislead)

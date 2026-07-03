@@ -172,6 +172,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if ((res.ok || accountExhausted429) && Object.keys(rl).length
           && accountManager.accounts[account.index] === account) {
         accountManager.updateQuota(account, rl);
+        // Track fruitless PARTIAL probes: a response that leaves the account
+        // half-measured (one window family still missing) counts toward the
+        // convergence cap in warmupCandidates; a full measurement resets it.
+        if (accountManager._fullyMeasured(account)) account._partialProbes = 0;
+        else if (accountManager._isMeasured(account)) account._partialProbes = (account._partialProbes || 0) + 1;
         console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
       }
     } catch (err) {
