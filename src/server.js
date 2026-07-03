@@ -200,7 +200,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // dashboard reads "—" again) — without waiting for client traffic to reach it.
   let warmupTimer = null;
   if (activeWarmup && warmupIntervalMs > 0) {
-    warmupTimer = setInterval(() => { warmupUnmeasured(); }, warmupIntervalMs);
+    warmupTimer = setInterval(() => {
+      // Sweep expired quota windows first: a rolled-over window keeps its
+      // account "measured" (with stale values) until some request-path sweep
+      // runs, and warm-up only probes UNMEASURED accounts — so without this an
+      // idle proxy would never re-measure after a reset. Sweep → unmeasured →
+      // the fan-out below re-probes → fresh data → ordering/display update.
+      accountManager.sweepExpired();
+      warmupUnmeasured();
+    }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
 

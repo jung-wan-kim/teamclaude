@@ -183,6 +183,27 @@ test('display list sorts unranked accounts by the automatic drain order (weekly 
     'ranked first, then unranked by weekly reset soonest (drain order)');
 });
 
+// Regression (user report): auto ordering is a continuous MODE, not a set-time
+// snapshot — when a reset time rolls over, the display order must follow at
+// once, without any settings operation and without waiting for a traffic sweep.
+test('the display order follows a reset rollover without any set operation', () => {
+  const am = new AccountManager([
+    { name: 'A', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'B', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0, 5);
+  const now = Date.now(), DAY = 86400_000;
+  am.accounts[0].quota.unified7d = 0.4; am.accounts[0].quota.unified7dReset = now + 1 * DAY;
+  am.accounts[1].quota.unified7d = 0.4; am.accounts[1].quota.unified7dReset = now + 3 * DAY;
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  assert.deepEqual(tui._displayList().map(a => a.name), ['A', 'B'], 'A drains first (soonest weekly)');
+
+  // A's week rolls over (its reset timestamp is now in the past) — its fresh
+  // window is unknown, so it must drop below B immediately, pre-sweep.
+  am.accounts[0].quota.unified7dReset = now - 1000;
+  assert.deepEqual(tui._displayList().map(a => a.name), ['B', 'A'],
+    'rolled-over account no longer pinned at the top by its past timestamp');
+});
+
 // Regression (adversarial review CRITICAL): the display list re-sorts live
 // (quota updates reorder the auto group), so an index-based cursor could let a
 // background reorder retarget a pending delete onto a NEIGHBORING account.

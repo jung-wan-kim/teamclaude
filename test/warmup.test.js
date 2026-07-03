@@ -69,6 +69,23 @@ test('warmupCandidates returns only available + unmeasured + idle accounts', () 
   assert.deepEqual(names, ['a1'], 'only the idle, unmeasured, enabled account is a candidate');
 });
 
+// ── unit: the periodic timer sweeps rolled-over windows on an idle proxy ────
+
+test('the periodic warm-up timer sweeps rolled-over windows even with no traffic', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.accounts[0].quota.unified5h = 0.5;
+  am.accounts[0].quota.unified5hReset = Date.now() - 1000;   // already rolled over
+  const proxy = createProxyServer(am, { upstream: 'http://127.0.0.1:9', warmupIntervalMs: 25 });
+  await listen(proxy);
+  try {
+    assert.equal(await waitFor(() => am.accounts[0].quota.unified5h == null), true,
+      'stale window cleared by the timer sweep alone (no request flowed)');
+    assert.equal(am._isMeasured(am.accounts[0]), false, 'account is a warm-up target again');
+  } finally {
+    await new Promise(r => proxy.close(r));
+  }
+});
+
 // ── integration: startup fan-out ───────────────────────────────────────────
 
 test('the first real request triggers a fan-out that measures the rest of the fleet', async () => {

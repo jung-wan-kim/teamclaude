@@ -314,6 +314,37 @@ test('an expired model-scoped weekly window is cleared lazily', () => {
   assert.deepEqual(am.accounts[0].quota.modelWeekly, {}, 'stale window removed after its reset passed');
 });
 
+// Regression (user report): ordering must follow reset ROLLOVERS continuously,
+// not just at set-time. A reset timestamp that has passed is the SMALLEST value,
+// so without clamping it pinned the account at the top of the auto order until
+// a request-path sweep happened to clear it.
+test('a reset that has rolled over stops ranking as "soonest" immediately (no sweep needed)', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  setWeekly(am, 0, 0.40, -1000, now);            // acct-0's week just rolled over (past)
+  setWeekly(am, 1, 0.40, 3 * 24 * HOUR, now);    // acct-1 resets in 3 days
+  assert.equal(am._weeklyResetTime(am.accounts[0]), Infinity, 'past weekly reset ranks at Infinity');
+  assert.equal(am.autoCompare(am.accounts[0], am.accounts[1]) > 0, true,
+    'rolled-over account no longer outranks the future-reset account');
+  // Session rollover behaves the same for the tiebreak.
+  setSession(am, 0, 0.10, -1000, now);
+  assert.equal(am._sessionResetTime(am.accounts[0]), Infinity, 'past session reset ranks at Infinity');
+});
+
+test('sweepExpired clears rolled-over windows so warm-up can re-measure (idle proxy)', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  setSession(am, 0, 0.50, -1000, now);           // both windows already rolled over
+  setWeekly(am, 0, 0.60, -1000, now);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.9, reset: now - 1000 };
+  assert.equal(am._isMeasured(am.accounts[0]), true, 'stale values still present before sweep');
+  am.sweepExpired();
+  assert.equal(am.accounts[0].quota.unified5h, null);
+  assert.equal(am.accounts[0].quota.unified7d, null);
+  assert.deepEqual(am.accounts[0].quota.modelWeekly, {});
+  assert.equal(am._isMeasured(am.accounts[0]), false, 'back to unmeasured → warm-up target again');
+});
+
 // ── quota snapshot persistence (survives a server restart) ───────────────────
 
 test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a future throttle', () => {

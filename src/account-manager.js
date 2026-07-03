@@ -497,18 +497,32 @@ export class AccountManager {
    * when BOTH utilization and reset are present: a partial/garbled header pair
    * (reset without utilization) must not outrank accounts with no 7d data,
    * matching the documented "no weekly data ranks at Infinity" semantics.
+   *
+   * A timestamp that has PASSED ranks at Infinity too: the moment a window
+   * rolls over, the account's old "resets soonest" claim is void (its fresh
+   * window is unknown until re-measured) — without this, the past timestamp
+   * (smallest value) would pin the account at the top of the order until a
+   * request-path sweep happened to clear it, so the order would NOT follow
+   * reset rollovers. The lazy sweep in _isNearQuota still clears the fields;
+   * this just makes ORDERING (selection and the TUI display, which has no
+   * sweep) reflect the rollover instantly.
    */
   _weeklyResetTime(account) {
     const q = account.quota;
-    return (q.unified7d != null && q.unified7dReset) ? q.unified7dReset : Infinity;
+    const r = (q.unified7d != null && q.unified7dReset) ? q.unified7dReset : Infinity;
+    return r > Date.now() ? r : Infinity;
   }
 
-  /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */
+  /**
+   * Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity.
+   * Expired timestamps rank at Infinity for the same rollover reason as
+   * _weeklyResetTime above.
+   */
   _sessionResetTime(account) {
     const q = account.quota;
-    if (q.unified5hReset) return q.unified5hReset;
-    if (q.resetsAt) return new Date(q.resetsAt).getTime();
-    return Infinity;
+    const r = q.unified5hReset
+      || (q.resetsAt ? new Date(q.resetsAt).getTime() : Infinity);
+    return r > Date.now() ? r : Infinity;
   }
 
   /** Session utilization 0–1: unified 5h (Max) → standard token/request usage → 0. */
@@ -522,6 +536,19 @@ export class AccountManager {
       return 1 - q.requestsRemaining / q.requestsLimit;
     }
     return 0;
+  }
+
+  /**
+   * Clear every account's expired quota windows NOW. The lazy sweep inside
+   * _isNearQuota only runs on selection paths (i.e. when a request flows), so
+   * on an idle proxy a rolled-over window would keep its stale values — and
+   * stay "measured", which prevents the periodic active warm-up from
+   * re-probing it. The server's warm-up timer calls this first, closing the
+   * loop: rollover → sweep → unmeasured → probe → fresh data → order updates.
+   * Idempotent and cheap (pure field clears).
+   */
+  sweepExpired() {
+    for (const a of this.accounts) this._isNearQuota(a);
   }
 
   /** True once we have any quota data for this account (rate-limit headers seen). */
