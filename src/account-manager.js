@@ -574,7 +574,13 @@ export class AccountManager {
    */
   _fullyMeasured(account) {
     if (account.type === 'oauth') {
-      return account.quota.unified5h != null && account.quota.unified7d != null;
+      // A window counts only when COMPLETE (utilization AND reset) — the same
+      // semantics the ordering helpers use. Utilization without its reset
+      // timestamp gives use-or-lose nothing to sort on, so such an account
+      // still needs a re-probe.
+      const q = account.quota;
+      return q.unified5h != null && q.unified5hReset != null
+        && q.unified7d != null && q.unified7dReset != null;
     }
     return this._isMeasured(account);
   }

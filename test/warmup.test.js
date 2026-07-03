@@ -211,6 +211,22 @@ test('transient 5xx probe failures do not burn the budget — recovery re-measur
   }
 });
 
+// Regression (review finding): utilization headers WITHOUT their reset
+// timestamps give use-or-lose nothing to sort on — such an account is not
+// "fully measured" and must remain a re-probe candidate (counting toward the
+// cap), not be silently accepted as complete.
+test('utilization-only headers (no resets) do not count as fully measured', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    // no -reset headers
+  });
+  assert.equal(am._isMeasured(am.accounts[0]), true, 'some data arrived');
+  assert.equal(am._fullyMeasured(am.accounts[0]), false, 'but the windows are incomplete');
+  assert.deepEqual(am.warmupCandidates().map(a => a.name), ['a0'], 'still a re-probe candidate');
+});
+
 // Regression (review findings): warm-up budget recovery paths.
 test('a rollover sweep renews BOTH warm-up budgets (_partialProbes and _warmupTries)', () => {
   const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
