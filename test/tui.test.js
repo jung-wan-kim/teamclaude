@@ -183,6 +183,35 @@ test('display list sorts unranked accounts by the automatic drain order (weekly 
     'ranked first, then unranked by weekly reset soonest (drain order)');
 });
 
+// Regression (adversarial review CRITICAL): the display list re-sorts live
+// (quota updates reorder the auto group), so an index-based cursor could let a
+// background reorder retarget a pending delete onto a NEIGHBORING account.
+// The cursor must anchor the account OBJECT, not the row index.
+test('a live display reorder cannot retarget a pending delete (cursor anchors the object)', () => {
+  const am = new AccountManager([
+    { name: 'a0', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0, 5);
+  const now = Date.now(), DAY = 86400_000;
+  // a0 drains first (soonest weekly reset) → display order [a0, a1]
+  am.accounts[0].quota.unified7d = 0.4; am.accounts[0].quota.unified7dReset = now + 1 * DAY;
+  am.accounts[1].quota.unified7d = 0.4; am.accounts[1].quota.unified7dReset = now + 3 * DAY;
+  const config = { accounts: [{ name: 'a0' }, { name: 'a1' }] };
+  const tui = new TUI({ accountManager: am, config, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+
+  tui.selIdx = 0;
+  tui._keyNormal('d');                 // anchor the cursor on a0, enter delete-confirm
+  assert.equal(tui.selAcct.name, 'a0', 'cursor anchored on the account object');
+
+  // Background quota update flips the auto order: a1 now resets sooner → [a1, a0]
+  am.accounts[1].quota.unified7dReset = now + 3600_000;
+  assert.equal(tui._displayList()[0].name, 'a1', 'display order flipped under the cursor');
+
+  tui._keySelect('enter');             // confirm — must delete the ANCHORED a0, not display[0]
+  assert.deepEqual(am.accounts.map(a => a.name), ['a1'], 'the anchored account was deleted, not its neighbor');
+  assert.deepEqual(config.accounts.map(a => a.name), ['a1']);
+});
+
 // ── normalization of legacy / duplicate priority values ─────────────────────
 
 test('duplicate / legacy priority values render as distinct positions and normalize on a move', async () => {

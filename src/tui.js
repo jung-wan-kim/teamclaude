@@ -124,7 +124,8 @@ export class TUI {
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
     this.mode = 'normal';    // normal | select (delete-confirm) | add | input | order
-    this.selIdx = 0;         // cursor over the account list (normal/select/order)
+    this.selIdx = 0;         // cursor POSITION over the display list (render hint)
+    this.selAcct = null;     // cursor ANCHOR: the selected account OBJECT (see _selected)
     this.orderAccount = null; // the account being moved while in 'order' mode
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -225,41 +226,69 @@ export class TUI {
     this.render();
   }
 
+  /**
+   * The cursor-selected ACCOUNT OBJECT. The display list re-sorts live — the
+   * auto group follows quota data, which background responses/probes update at
+   * any time — so a bare display index is racy: the row under the cursor can
+   * become a *different account* between two keypresses. Anchoring the
+   * selection on the object means a reorder moves the highlight with the
+   * account and can never retarget a pending action (notably delete) onto a
+   * neighbor. Falls back to the remembered position when the anchored account
+   * is gone (deleted / synced away), and keeps `selIdx` synced for rendering.
+   */
+  _selected() {
+    const list = this._displayList();
+    if (list.length === 0) { this.selAcct = null; return null; }
+    if (this.selAcct) {
+      const pos = list.indexOf(this.selAcct);
+      if (pos >= 0) { this.selIdx = pos; return this.selAcct; }
+    }
+    this.selIdx = Math.min(Math.max(0, this.selIdx), list.length - 1);
+    this.selAcct = list[this.selIdx];
+    return this.selAcct;
+  }
+
+  /** Move the cursor by dir (±1) over the CURRENT display order, re-anchoring the object. */
+  _moveSel(dir) {
+    const list = this._displayList();
+    if (list.length === 0) return;
+    this._selected(); // sync selIdx to the anchored account's current position
+    this.selIdx = Math.min(Math.max(0, this.selIdx + dir), list.length - 1);
+    this.selAcct = list[this.selIdx];
+  }
+
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); return; }
     if (k === 'a') { this.mode = 'add'; return; }
     if (k === 'R') { this._doSync(); return; }
 
-    const len = this.am.accounts.length;
-    if (len === 0) return;
-    if (this.selIdx >= len) this.selIdx = len - 1; // keep the cursor in range
-    const selected = () => this._displayList()[this.selIdx];
+    if (this.am.accounts.length === 0) return;
 
     // ↑/↓ (or k/j) move a selection cursor over the account list right here in the
     // default view — no need to enter a sub-mode first.
-    if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
-    else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
-    // The action keys act DIRECTLY on the cursor-selected account.
-    else if (k === 's') { const a = selected(); if (a) { this.am.currentIndex = a.index; this._addLog(`Switched to "${a.name}"`); } }
-    else if (k === 'e') { const a = selected(); if (a) this._doToggleEnabled(a.index); }
-    else if (k === 'o') { const a = selected(); if (a) { this.orderAccount = a; this.mode = 'order'; } }
+    if (k === 'up' || k === 'k') this._moveSel(-1);
+    else if (k === 'down' || k === 'j') this._moveSel(+1);
+    // The action keys act DIRECTLY on the cursor-selected account (object-anchored).
+    else if (k === 's') { const a = this._selected(); if (a) { this.am.currentIndex = a.index; this._addLog(`Switched to "${a.name}"`); } }
+    else if (k === 'e') { const a = this._selected(); if (a) this._doToggleEnabled(a.index); }
+    else if (k === 'o') { const a = this._selected(); if (a) { this.orderAccount = a; this.mode = 'order'; } }
     // Delete keeps an explicit confirmation (it's destructive): the cursor account
-    // is pre-selected and Enter in select mode confirms.
-    else if (k === 'd') { this.mode = 'select'; }
+    // is pre-selected (anchored) and Enter in select mode confirms.
+    else if (k === 'd') { this._selected(); this.mode = 'select'; }
   }
 
   // Select mode is now the DELETE confirmation only — switch / enable-disable /
   // order act directly on the normal-mode ↑/↓ cursor. Here ↑/↓ let you re-pick
   // before confirming; Enter deletes the selected account, Esc cancels.
   _keySelect(k) {
-    const len = this.am.accounts.length;
-    if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
-    else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+    if (k === 'up' || k === 'k') this._moveSel(-1);
+    else if (k === 'down' || k === 'j') this._moveSel(+1);
     else if (k === 'enter') {
-      // selIdx indexes the DISPLAY order (ranked first, then use-or-lose); resolve
-      // to the account object, then act by its live array index (reindex-safe).
-      const acct = this._displayList()[this.selIdx];
-      if (acct) this._doRemove(acct.index);
+      // Act on the ANCHORED account object, resolved to its live array index at
+      // action time (reindex-safe, and immune to a display reorder that happened
+      // after the cursor was placed).
+      const acct = this._selected();
+      if (acct) this._doRemove(this.am.accounts.indexOf(acct));
       this.mode = 'normal';
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
@@ -271,25 +300,31 @@ export class TUI {
     }
     if (k === 'up' || k === 'k') {
       this._moveOrder(this.orderAccount, -1); // sync mutate; save is coalesced inside
-      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+      this._followOrderAccount();
     } else if (k === 'down' || k === 'j') {
       this._moveOrder(this.orderAccount, +1);
-      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+      this._followOrderAccount();
     } else if (k === 'a') {
       // Auto: reset the ENTIRE order — every rank is cleared and the whole
       // fleet returns to automatic use-or-lose routing (weekly reset soonest
       // drained first). The list re-sorts to that drain order immediately.
       this._applyRanking([]);
       this._addLog('Order reset: all accounts on auto (weekly-reset order)');
-      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+      this._followOrderAccount();
     } else if (k === 'c') {
       // Clear: un-rank just the grabbed account (one keypress instead of moving
       // it down past the bottom of the ranked group).
       this._setAutoOrder(this.orderAccount);
-      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+      this._followOrderAccount();
     } else if (k === 'enter' || k === 'esc' || k === 'q') {
       this.mode = 'normal'; this.orderAccount = null;
     }
+  }
+
+  /** Keep the cursor anchored on the account being ordered as the list re-sorts. */
+  _followOrderAccount() {
+    this.selAcct = this.orderAccount;
+    this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
   }
 
   _keyAdd(k) {
@@ -434,6 +469,9 @@ export class TUI {
     let cfgIdx = uuid ? this.config.accounts.findIndex(c => c.accountUuid === uuid) : -1;
     if (cfgIdx < 0) cfgIdx = this.config.accounts.findIndex(c => c.name === name);
     if (cfgIdx >= 0) this.config.accounts.splice(cfgIdx, 1);
+    // Drop a cursor anchor that pointed at the removed account; _selected()
+    // falls back to the remembered position on the next keypress/render.
+    if (this.selAcct && !this.am.accounts.includes(this.selAcct)) this.selAcct = null;
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
     this._addLog(`Deleted account "${name}"`);
@@ -611,6 +649,10 @@ export class TUI {
           ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
           : Math.max(5, Math.min(20, W - 45));
 
+      // Sync the cursor position to the anchored account before drawing — the
+      // display order may have changed since the last frame (quota updates
+      // re-sort the auto group), and the highlight must follow the account.
+      this._selected();
       const display = this._displayList();
       for (let pos = 0; pos < display.length; pos++) {
         lines.push(this._renderAcct(display[pos], pos, bw, showBoth, showThree));
