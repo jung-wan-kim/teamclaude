@@ -91,7 +91,7 @@ teamclaude server
 ```
 
 When running from a TTY, shows an interactive TUI with:
-- Account table with session/weekly quota progress bars (usage % overlaid, plus a reset countdown when space allows); wide terminals add a third `Fbl` bar with the model-scoped weekly limit (the separate "Fable" weekly limit from Claude's usage UI)
+- Account table with session/weekly quota progress bars (usage % overlaid, plus a reset countdown when space allows); wide terminals add a third `Fbl` bar with the model-scoped weekly limit (the separate "Fable" weekly limit from Claude's usage UI). Ranked accounts are listed first, then the `auto` accounts in their actual drain order (weekly reset soonest first)
 - Real-time activity log with request tracking
 - Keyboard shortcuts (see below)
 
@@ -106,7 +106,7 @@ If the configured port is already in use — for example another TeamClaude prox
 | `↑`/`↓` | Move the selection cursor over the accounts |
 | `s` | Switch active account (to the selected one) |
 | `e` | Enable / disable the selected account |
-| `o` | Order the selected account: `↑`/`↓` move its rank, `a` returns it to `auto` (weekly-reset ordering) |
+| `o` | Order the selected account: `↑`/`↓` move its rank, `a` resets the WHOLE order to `auto` (weekly-reset ordering), `c` clears just this account's rank |
 | `a` | Add account (import or API key) |
 | `d` | Delete an account (with confirmation) |
 | `R` | Reload accounts from config |
@@ -199,7 +199,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
    - **Rate/concurrency or transient 429** (account has token quota left but was hit too fast, or a transient limit) → the request fails over to another available account (per-request, without throttling the account), so concurrent overflow spreads to an idle account instead of erroring. If *every* account has been tried for the request (→ effectively global), the 429 is passed through — still without throttling any account, so the fleet isn't poisoned.
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
 8. If all accounts are exhausted, returns 429 with the soonest reset time
-9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+9. **Quota survives restarts**: the server snapshots per-account quota/throttle state to `<config>.quota.json` (every minute and on exit) and restores it at startup, so a restart doesn't blank the dashboard or blind the use-or-lose ordering; expired windows are swept lazily and re-measured from live traffic
+10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 

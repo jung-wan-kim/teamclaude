@@ -314,6 +314,47 @@ test('an expired model-scoped weekly window is cleared lazily', () => {
   assert.deepEqual(am.accounts[0].quota.modelWeekly, {}, 'stale window removed after its reset passed');
 });
 
+// ── quota snapshot persistence (survives a server restart) ───────────────────
+
+test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a future throttle', () => {
+  const now = Date.now();
+  const am1 = new AccountManager(makeAccounts(2), 0.98);
+  am1.accounts[0].accountUuid = 'uuid-0';
+  setSession(am1, 0, 0.54, 1 * HOUR, now);
+  setWeekly(am1, 0, 0.86, 4 * 24 * HOUR, now);
+  am1.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: now + 4 * 24 * HOUR };
+  am1.markRateLimited(0, 120);                       // throttled 2 min into the future
+  am1.updateQuota(1, {});                            // bump usage counters only
+
+  const snapshot = JSON.parse(JSON.stringify(am1.exportQuotaState())); // via-disk fidelity
+
+  const am2 = new AccountManager(makeAccounts(2), 0.98);
+  am2.accounts[0].accountUuid = 'uuid-0';
+  am2.importQuotaState(snapshot);
+  assert.equal(am2.accounts[0].quota.unified5h, 0.54);
+  assert.equal(am2.accounts[0].quota.unified7d, 0.86);
+  assert.equal(am2.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94);
+  assert.equal(am2.accounts[0].status, 'throttled', 'future throttle restored');
+  assert.equal(am2._isMeasured(am2.accounts[0]), true, 'restored account skips warm-up');
+  assert.equal(am2.accounts[1].usage.totalRequests, 1, 'usage counters carried over');
+});
+
+test('importQuotaState skips unknown accounts, expired throttles, and tolerates an old cache shape', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  am.importQuotaState([
+    { name: 'ghost', quota: { unified5h: 0.9 } },                       // no such account → skipped
+    { name: 'acct-0',
+      quota: { unified5h: 0.3, unified5hReset: now + HOUR },            // old cache: no modelWeekly field
+      rateLimitedUntil: now - 5000 },                                   // throttle already expired
+    null, 'garbage',                                                    // corrupt entries → ignored
+  ]);
+  assert.equal(am.accounts[0].quota.unified5h, 0.3);
+  assert.deepEqual(am.accounts[0].quota.modelWeekly, {}, 'missing modelWeekly backfilled to {}');
+  assert.equal(am.accounts[0].status, 'active', 'expired throttle NOT restored');
+  assert.equal(am.accounts[0].rateLimitedUntil, null);
+});
+
 test('getStatus exposes modelWeekly as a detached copy', () => {
   const am = new AccountManager(makeAccounts(1), 0.98);
   const now = Date.now();

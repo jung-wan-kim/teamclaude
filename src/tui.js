@@ -276,9 +276,15 @@ export class TUI {
       this._moveOrder(this.orderAccount, +1);
       this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
     } else if (k === 'a') {
-      // Auto: un-rank the grabbed account in one keypress (instead of moving it
-      // down past the bottom of the ranked group) — back to automatic
-      // use-or-lose routing (weekly reset soonest first).
+      // Auto: reset the ENTIRE order — every rank is cleared and the whole
+      // fleet returns to automatic use-or-lose routing (weekly reset soonest
+      // drained first). The list re-sorts to that drain order immediately.
+      this._applyRanking([]);
+      this._addLog('Order reset: all accounts on auto (weekly-reset order)');
+      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+    } else if (k === 'c') {
+      // Clear: un-rank just the grabbed account (one keypress instead of moving
+      // it down past the bottom of the ranked group).
       this._setAutoOrder(this.orderAccount);
       this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
     } else if (k === 'enter' || k === 'esc' || k === 'q') {
@@ -468,11 +474,18 @@ export class TUI {
       .sort((a, b) => (a.priority - b.priority) || (a.index - b.index));
   }
 
-  /** Display order: ranked accounts first (in order), then unranked (array order). */
+  /**
+   * Display order: ranked accounts first (in rank order), then unranked in
+   * their ACTUAL automatic drain order (weekly reset soonest first — the same
+   * comparator selection uses), so the list shows what "auto" will do next.
+   * autoCompare returns 0 on ties and Array.sort is stable, so accounts with
+   * no quota data keep their array order (the previous display behavior).
+   */
   _displayList() {
     const ranked = this._rankedSorted();
     const set = new Set(ranked);
-    return [...ranked, ...this.am.accounts.filter(a => !set.has(a))];
+    const auto = this.am.accounts.filter(a => !set.has(a)).sort((a, b) => this.am.autoCompare(a, b));
+    return [...ranked, ...auto];
   }
 
   /** 1-based rank position among the ranked accounts, or null if unranked. */
@@ -744,7 +757,7 @@ export class TUI {
       case 'select':
         return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
       case 'order':
-        return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto (weekly-reset order)  ${bold('Enter')}/${bold('Esc')} done`;
+        return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto-all (reset order, weekly-reset)  ${bold('c')}lear rank  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':

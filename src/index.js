@@ -3,7 +3,7 @@
 import { spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -127,6 +127,26 @@ async function serverCommand() {
     : 256;
   const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault, overflowQueueMaxDepth);
 
+  // Restore the last run's quota snapshot so a restart doesn't blank the
+  // dashboard (quota otherwise lives only in memory and is re-learned from
+  // traffic). Stale-safe: the proxy takes no traffic while down, expired
+  // windows are lazily swept, and a still-future throttle is re-applied.
+  const quotaCache = await readQuotaCache();
+  if (quotaCache?.accounts) {
+    accountManager.importQuotaState(quotaCache.accounts);
+    // Restore the active-account marker too (identity by name) so the sticky
+    // primary — and its warm prompt cache — carries across the restart.
+    const cur = quotaCache.currentAccount
+      && accountManager.accounts.find(a => a.name === quotaCache.currentAccount);
+    if (cur) accountManager.currentIndex = cur.index;
+    console.log(`[TeamClaude] Restored quota snapshot for ${quotaCache.accounts.length} account(s)`);
+  }
+  const saveQuotaSnapshot = () => writeQuotaCacheSync({
+    savedAt: new Date().toISOString(),
+    currentAccount: accountManager.accounts[accountManager.currentIndex]?.name || null,
+    accounts: accountManager.exportQuotaState(),
+  });
+
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
@@ -238,6 +258,11 @@ async function serverCommand() {
     writeServerState({ pid: process.pid, port, startedAt: new Date().toISOString(), config: getConfigPath() }).catch(() => {});
     const stateP = getServerStatePath();
     process.on('exit', () => { try { unlinkSync(stateP); } catch { /* already gone */ } });
+    // Persist the quota snapshot on every exit path (TUI quit, SIGINT/SIGTERM
+    // → server.close → process.exit) and every minute as a crash backstop
+    // (a SIGKILL loses at most the last interval). The 'exit' write is sync.
+    process.on('exit', saveQuotaSnapshot);
+    setInterval(saveQuotaSnapshot, 60_000).unref();
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);

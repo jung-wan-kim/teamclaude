@@ -440,13 +440,7 @@ export class AccountManager {
       const pa = this._priority(a);
       const pb = this._priority(b);
       if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
-      const wa = this._weeklyResetTime(a);
-      const wb = this._weeklyResetTime(b);
-      if (wa !== wb) return wa - wb;                                     // then soonest WEEKLY reset (drain what renews first)
-      const ra = this._sessionResetTime(a);
-      const rb = this._sessionResetTime(b);
-      if (ra !== rb) return ra - rb;                                     // then soonest session reset
-      return this._sessionUtilization(a) - this._sessionUtilization(b);  // then least used
+      return this.autoCompare(a, b);                                     // then the automatic use-or-lose order
     });
 
     // Accounts tied for the best rank (notably all-unknown at cold start, or all
@@ -477,6 +471,23 @@ export class AccountManager {
    */
   _priority(account) {
     return Number.isFinite(account.priority) ? account.priority : Infinity;
+  }
+
+  /**
+   * The automatic ("auto") use-or-lose comparator, shared by selection and the
+   * TUI display order: soonest WEEKLY reset (drain what renews first) → soonest
+   * session reset → lowest session utilization. Returns 0 on a full tie, so a
+   * stable sort keeps ties in array order (the pre-weekly behavior for API-key
+   * fleets and unmeasured accounts).
+   */
+  autoCompare(a, b) {
+    const wa = this._weeklyResetTime(a);
+    const wb = this._weeklyResetTime(b);
+    if (wa !== wb) return wa - wb;
+    const ra = this._sessionResetTime(a);
+    const rb = this._sessionResetTime(b);
+    if (ra !== rb) return ra - rb;
+    return this._sessionUtilization(a) - this._sessionUtilization(b);
   }
 
   /**
@@ -1021,6 +1032,60 @@ export class AccountManager {
     const ra = this._sessionResetTime(a), rb = this._sessionResetTime(b);
     if (ra !== rb) return ra < rb;
     return this._sessionUtilization(a) < this._sessionUtilization(b);
+  }
+
+  /**
+   * Snapshot of per-account quota state for persistence across restarts
+   * (credential-free). Quota lives only in memory otherwise, so a restart used
+   * to blank the whole dashboard (and blind use-or-lose ordering) until traffic
+   * organically re-measured every account.
+   */
+  exportQuotaState() {
+    return this.accounts.map(a => ({
+      accountUuid: a.accountUuid || null,
+      name: a.name,
+      quota: {
+        ...a.quota,
+        modelWeekly: Object.fromEntries(
+          Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+      },
+      rateLimitedUntil: a.rateLimitedUntil,
+      usage: { ...a.usage },
+    }));
+  }
+
+  /**
+   * Restore a quota snapshot from a previous run. Matched by accountUuid first,
+   * then name (identity keys — indexes shift); unknown entries are skipped.
+   * Values may be slightly stale, but the proxy takes no traffic while it's
+   * down, and expired windows are lazily swept by _isNearQuota on first use —
+   * so a restore is strictly better than starting blind. A still-future
+   * rateLimitedUntil re-throttles the account; error/exhausted statuses are
+   * deliberately NOT restored (a bad token may have been fixed since).
+   */
+  importQuotaState(saved) {
+    for (const s of Array.isArray(saved) ? saved : []) {
+      if (!s || typeof s !== 'object') continue;
+      const a = (s.accountUuid && this.accounts.find(x => x.accountUuid === s.accountUuid))
+        || this.accounts.find(x => x.name === s.name);
+      if (!a) continue;
+      if (s.quota && typeof s.quota === 'object') {
+        // Merge over emptyQuota so a cache written by an older version (missing
+        // newer fields like modelWeekly) still yields a complete quota object.
+        a.quota = {
+          ...emptyQuota(),
+          ...s.quota,
+          modelWeekly: Object.fromEntries(
+            Object.entries(s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object' ? s.quota.modelWeekly : {})
+              .map(([k, w]) => [k, { ...w }])),
+        };
+      }
+      if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
+      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()) {
+        a.rateLimitedUntil = s.rateLimitedUntil;
+        a.status = 'throttled';
+      }
+    }
   }
 
   /**

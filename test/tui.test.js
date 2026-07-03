@@ -134,7 +134,26 @@ test('order mode: ↑ moves the grabbed account and the selection follows it', (
   assert.equal(tui._displayList()[tui.selIdx], am.accounts[2], 'selection stays on the moved account');
 });
 
-test('order mode: "a" un-ranks the grabbed account back to auto in one keypress', () => {
+test('order mode: "a" resets the ENTIRE order — every rank cleared to auto', () => {
+  const { tui, am, config } = makeTUI(['a0', 'a1', 'a2']);
+  tui._moveOrder(am.accounts[0], -1);            // a0 #1
+  tui._moveOrder(am.accounts[1], -1);            // a1 #2
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, 1, null]);
+
+  tui.orderAccount = am.accounts[2];
+  tui.mode = 'order';
+  tui._keyOrder('a');                             // reset the whole order
+  assert.deepEqual(am.accounts.map(a => a.priority), [null, null, null], 'every account back to auto');
+  // a0/a1 had ranks → explicit null persisted (so a stale disk value cannot
+  // survive a merge); a2 was never ranked → its config entry stays untouched.
+  assert.deepEqual(config.accounts.map(a => a.priority), [null, null, undefined]);
+  assert.equal(tui.mode, 'order', 'stays in order mode (Enter/Esc to finish)');
+
+  tui._keyOrder('a');                             // already all-auto → harmless no-op
+  assert.deepEqual(am.accounts.map(a => a.priority), [null, null, null]);
+});
+
+test('order mode: "c" clears ONLY the grabbed account\'s rank', () => {
   const { tui, am, config } = makeTUI(['a0', 'a1', 'a2']);
   tui._moveOrder(am.accounts[0], -1);            // a0 #1
   tui._moveOrder(am.accounts[1], -1);            // a1 #2
@@ -142,15 +161,26 @@ test('order mode: "a" un-ranks the grabbed account back to auto in one keypress'
 
   tui.orderAccount = am.accounts[0];
   tui.mode = 'order';
-  tui._keyOrder('a');                             // a0 → auto
-  assert.equal(am.accounts[0].priority, null, 'a0 back to auto (use-or-lose)');
+  tui._keyOrder('c');                             // a0 → auto, a1 keeps its (renumbered) rank
+  assert.equal(am.accounts[0].priority, null, 'grabbed account back to auto');
   assert.equal(am.accounts[1].priority, 0, 'remaining ranked renumbered contiguously');
-  assert.equal(config.accounts[0].priority, null, 'persisted null so a stale disk value cannot survive');
-  assert.equal(tui.mode, 'order', 'stays in order mode (Enter/Esc to finish)');
+  assert.equal(config.accounts[0].priority, null, 'persisted');
   assert.equal(tui._displayList()[tui.selIdx], am.accounts[0], 'selection follows the account');
+});
 
-  tui._keyOrder('a');                             // already auto → harmless no-op
-  assert.equal(am.accounts[0].priority, null);
+test('display list sorts unranked accounts by the automatic drain order (weekly reset soonest first)', () => {
+  const am = new AccountManager([
+    { name: 'far',  type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'soon', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'pin',  type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000, priority: 0 },
+  ], 0.98, 0, 5);
+  const now = Date.now();
+  const HOUR = 3600_000;
+  am.accounts[0].quota.unified7d = 0.4; am.accounts[0].quota.unified7dReset = now + 6 * 24 * HOUR;
+  am.accounts[1].quota.unified7d = 0.4; am.accounts[1].quota.unified7dReset = now + 1 * 24 * HOUR;
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  assert.deepEqual(tui._displayList().map(a => a.name), ['pin', 'soon', 'far'],
+    'ranked first, then unranked by weekly reset soonest (drain order)');
 });
 
 // ── normalization of legacy / duplicate priority values ─────────────────────

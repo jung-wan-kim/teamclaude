@@ -1,4 +1,5 @@
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
+import { writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -33,6 +34,33 @@ export async function readServerState() {
 
 export async function clearServerState() {
   try { await rm(getServerStatePath(), { force: true }); } catch { /* best-effort */ }
+}
+
+// Per-account quota snapshot (credential-free), written next to the config so a
+// restarted server starts from the last known quota/throttle state instead of a
+// blank dashboard. Unlike the server-state file this survives exit on purpose.
+export function getQuotaCachePath() {
+  return getConfigPath().replace(/\.json$/, '') + '.quota.json';
+}
+
+export async function readQuotaCache() {
+  try {
+    return JSON.parse(await readFile(getQuotaCachePath(), 'utf-8'));
+  } catch {
+    return null; // missing or unreadable → start unmeasured, exactly as before
+  }
+}
+
+/**
+ * Synchronous on purpose: the last write happens inside a process 'exit'
+ * handler, where async I/O never completes. The snapshot is small (a few KB).
+ */
+export function writeQuotaCacheSync(data) {
+  try {
+    const path = getQuotaCachePath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  } catch { /* best-effort — a failed snapshot must never break the proxy */ }
 }
 
 export function createDefaultConfig() {
