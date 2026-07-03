@@ -225,6 +225,18 @@ test('a wide row renders a third "Fbl" bar for an OAuth account', () => {
   assert.doesNotMatch(mid, /Fbl/, 'no third bar on mid widths');
 });
 
+test('the Fbl bar prefers the 7d_oi window when multiple model windows exist', () => {
+  const am = new AccountManager([
+    { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0, 5);
+  // Insert an unknown window FIRST, then 7d_oi — the bar must still show 7d_oi.
+  am.accounts[0].quota.modelWeekly['7d_xx'] = { utilization: 0.11, reset: Date.now() + 86400_000 };
+  am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: Date.now() + 86400_000 };
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  const row = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
+  assert.match(row, /Fbl .*94%/s, '7d_oi (94%) shown, not the first-inserted window (11%)');
+});
+
 test('an unmeasured Fable window renders an empty Fbl bar; API-key rows pad the slot', () => {
   const am = new AccountManager([
     { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },

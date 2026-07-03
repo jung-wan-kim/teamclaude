@@ -640,7 +640,7 @@ async function statusCommand() {
         console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
       }
 
-      if (q.unified5h != null || q.unified7d != null) {
+      if (q.unified5h != null || q.unified7d != null || Object.keys(q.modelWeekly ?? {}).length > 0) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
         let line = `    Session:  ${ses} used    Weekly: ${wk} used`;

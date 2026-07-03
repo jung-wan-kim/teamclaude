@@ -274,6 +274,24 @@ test('a model-scoped weekly limit over threshold does NOT make the account unava
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
+// Regression (review finding): a partial header pair — 7d-reset present but
+// 7d-utilization missing/garbled — leaves a reset timestamp with no utilization.
+// The expiry sweep used to be gated on `unified7d != null`, so that stale PAST
+// timestamp survived forever and, with weekly-first ordering, permanently biased
+// selection toward the account. The sweep must clear reset times independently.
+test('a stale reset-only weekly timestamp is cleared (no permanent selection bias)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const now = Date.now();
+  setSession(am, 0, 0.20, 4 * HOUR, now);
+  setSession(am, 1, 0.20, 4 * HOUR, now);
+  // acct-0 got a garbled pair: reset set (already in the past), utilization never set.
+  am.accounts[0].quota.unified7dReset = now - 1000;
+  setWeekly(am, 1, 0.40, 3 * 24 * HOUR, now);
+  am.getActiveAccount();                       // _isAvailable → expiry sweep
+  assert.equal(am.accounts[0].quota.unified7dReset, null, 'stale reset-only timestamp swept');
+  assert.equal(am._weeklyResetTime(am.accounts[0]), Infinity, 'no longer sorts as "resets soonest"');
+});
+
 test('an expired model-scoped weekly window is cleared lazily', () => {
   const am = new AccountManager(makeAccounts(1), 0.98);
   const now = Date.now();

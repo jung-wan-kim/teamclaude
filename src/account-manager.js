@@ -610,14 +610,17 @@ export class AccountManager {
     const q = account.quota;
     const now = Date.now();
 
-    // Clear expired unified quotas
-    if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+    // Clear expired unified quotas. The reset timestamp is cleared even when the
+    // matching utilization was never set (a partial/garbled header pair) — a
+    // stale past timestamp would otherwise survive forever and, since selection
+    // sorts by reset time, permanently bias the ordering toward that account.
+    if (q.unified5hReset && now >= q.unified5hReset) {
+      if (q.unified5h != null) console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
     }
-    if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+    if (q.unified7dReset && now >= q.unified7dReset) {
+      if (q.unified7d != null) console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;

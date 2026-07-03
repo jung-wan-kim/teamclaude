@@ -693,9 +693,13 @@ export class TUI {
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
       // Third bar: the model-scoped weekly window (7d_oi — the top-model weekly
-      // limit shown as "Fable" in Claude's usage UI). Unknown window labels
-      // still render, tagged by their suffix, so a renamed header keeps showing.
-      const mw = q.modelWeekly && Object.entries(q.modelWeekly)[0];
+      // limit shown as "Fable" in Claude's usage UI). Prefer 7d_oi explicitly so
+      // another window appearing first can't hide the Fable quota; an unknown
+      // label still renders, tagged by its suffix, so a renamed header keeps
+      // showing.
+      const mw = q.modelWeekly && (
+        ('7d_oi' in q.modelWeekly && ['7d_oi', q.modelWeekly['7d_oi']])
+        || Object.entries(q.modelWeekly)[0]);
       l3 = 'Fbl';
       if (mw) {
         const [label, win] = mw;
