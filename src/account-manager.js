@@ -482,10 +482,14 @@ export class AccountManager {
   /**
    * Weekly reset timestamp (ms): unified 7d (Max) → Infinity. API-key accounts
    * have no weekly window, so they tie at Infinity and the session tiebreak
-   * decides — exactly the pre-weekly-ordering behavior.
+   * decides — exactly the pre-weekly-ordering behavior. The window counts only
+   * when BOTH utilization and reset are present: a partial/garbled header pair
+   * (reset without utilization) must not outrank accounts with no 7d data,
+   * matching the documented "no weekly data ranks at Infinity" semantics.
    */
   _weeklyResetTime(account) {
-    return account.quota.unified7dReset || Infinity;
+    const q = account.quota;
+    return (q.unified7d != null && q.unified7dReset) ? q.unified7dReset : Infinity;
   }
 
   /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */
@@ -783,6 +787,16 @@ export class AccountManager {
    *
    * Call this *after* updateQuota() has folded the 429's rate-limit headers
    * into the account's quota state.
+   *
+   * Model-scoped windows (quota.modelWeekly, e.g. the Fable 7d_oi limit) are
+   * deliberately NOT consulted here. On a real upstream 429 for that model tier
+   * the top-level `unified-status` is `rejected` too (the binding claim is
+   * reflected there — verified against live traffic), so the exhaustion IS
+   * detected; folding 7d_oi in additionally would change nothing on real
+   * headers, and reacting to it alone would globally throttle an account that
+   * still serves every other model. Per-model routing (skip Fable-exhausted
+   * accounts only for Fable requests, without the 5-min global throttle) would
+   * need the request's model plumbed into selection — a separate feature.
    */
   isExhausted(accountIndex) {
     const account = this._resolve(accountIndex);

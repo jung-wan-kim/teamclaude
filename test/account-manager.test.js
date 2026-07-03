@@ -292,6 +292,19 @@ test('a stale reset-only weekly timestamp is cleared (no permanent selection bia
   assert.equal(am._weeklyResetTime(am.accounts[0]), Infinity, 'no longer sorts as "resets soonest"');
 });
 
+// A FUTURE reset-only value (utilization missing/garbled) must not outrank an
+// account with no 7d data either — the weekly window counts only when both
+// utilization and reset are present ("no weekly data ranks at Infinity").
+test('a reset-only weekly window (no utilization) does not bias weekly ordering', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const now = Date.now();
+  setSession(am, 0, 0.20, 4 * HOUR, now);
+  am.accounts[0].quota.unified7dReset = now + 60_000;   // future reset, utilization never set
+  setSession(am, 1, 0.20, 5 * MIN, now);                // no 7d data, soonest session
+  assert.equal(am._weeklyResetTime(am.accounts[0]), Infinity, 'partial window ranks at Infinity');
+  assert.equal(am.getActiveAccount().name, 'acct-1', 'weekly tie → soonest session still wins');
+});
+
 test('an expired model-scoped weekly window is cleared lazily', () => {
   const am = new AccountManager(makeAccounts(1), 0.98);
   const now = Date.now();
