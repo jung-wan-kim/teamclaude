@@ -26,10 +26,16 @@ async function waitFor(cond, ms = 2000) {
   return cond();
 }
 
+// Mirror the real upstream contract: a Max response always carries BOTH the 5h
+// and the 7d window. (A 5h-only mock would leave OAuth accounts permanently
+// half-measured, so active warm-up candidacy — which re-probes half-measured
+// accounts — would never converge in tests.)
 const RL_HEADERS = () => ({
   'content-type': 'application/json',
   'anthropic-ratelimit-unified-5h-utilization': '0.1',
   'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  'anthropic-ratelimit-unified-7d-utilization': '0.2',
+  'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
 });
 
 // An upstream that records each request (auth, beta header, body) and answers
@@ -52,11 +58,8 @@ function measured(am, name) {
 
 test('warmupCandidates returns only available + unmeasured + idle accounts', () => {
   const am = new AccountManager(makeAccounts(5), 0.98, 0, 3);
-  // a0 measured
-  am.updateQuota(0, {
-    'anthropic-ratelimit-unified-5h-utilization': '0.1',
-    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
-  });
+  // a0 measured (both windows, as a real response reports)
+  am.updateQuota(0, RL_HEADERS());
   // a1 unmeasured + idle → the only candidate
   // a2 disabled
   am.setEnabled(am.accounts[2], false);
@@ -67,6 +70,24 @@ test('warmupCandidates returns only available + unmeasured + idle accounts', () 
 
   const names = am.warmupCandidates().map(a => a.name);
   assert.deepEqual(names, ['a1'], 'only the idle, unmeasured, enabled account is a candidate');
+});
+
+// Regression (review finding): a PARTIAL rollover — weekly window swept while
+// the session window survives — left the account "measured", so periodic
+// warm-up never re-probed it and its weekly quota/order stayed unknown until
+// real traffic arrived. A half-measured OAuth account must be a candidate.
+test('a partially-measured OAuth account (weekly swept, session alive) is re-probed', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const now = Date.now();
+  am.accounts[0].quota.unified5h = 0.2;
+  am.accounts[0].quota.unified5hReset = now + 4 * HOUR;   // session window still valid
+  am.accounts[0].quota.unified7d = 0.4;
+  am.accounts[0].quota.unified7dReset = now - 1000;        // weekly just rolled over
+  am.sweepExpired();                                       // clears the weekly half only
+  assert.equal(am.accounts[0].quota.unified7d, null);
+  assert.equal(am.accounts[0].quota.unified5h, 0.2, 'session half survives the sweep');
+  assert.deepEqual(am.warmupCandidates().map(a => a.name), ['a0'],
+    'half-measured account is a warm-up candidate again');
 });
 
 // ── unit: the periodic timer sweeps rolled-over windows on an idle proxy ────
@@ -223,9 +244,8 @@ test('a non-exhaustion 429 probe (rate-limit headers but not "rejected") does no
       // 429 WITH rate-limit headers but unified-status "allowed" → a request-rate /
       // global limit, NOT account exhaustion. Must leave the account untouched.
       res.writeHead(429, {
-        'content-type': 'application/json',
+        ...RL_HEADERS(),
         'anthropic-ratelimit-unified-5h-utilization': '0.5',
-        'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
         'anthropic-ratelimit-unified-status': 'allowed',
         'retry-after': '1',
       });

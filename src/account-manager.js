@@ -559,6 +559,21 @@ export class AccountManager {
   }
 
   /**
+   * Fully measured, for ACTIVE warm-up candidacy: an OAuth (Max) response
+   * always carries both the 5h and the 7d window, so a missing half — e.g. a
+   * weekly rollover swept `unified7d` while the session window survived —
+   * means the account needs a re-probe or its weekly quota/ordering stays
+   * unknown until real traffic reaches it. One probe repopulates both windows,
+   * so candidacy converges. API-key accounts keep the any-data semantics.
+   */
+  _fullyMeasured(account) {
+    if (account.type === 'oauth') {
+      return account.quota.unified5h != null && account.quota.unified7d != null;
+    }
+    return this._isMeasured(account);
+  }
+
+  /**
    * An account still needing warm-up: available, not yet MEASURED, under the
    * per-account attempt cap.
    *
@@ -621,7 +636,7 @@ export class AccountManager {
    */
   warmupCandidates() {
     return this.accounts.filter(a =>
-      this._isAvailable(a) && !this._isMeasured(a) && a.inflight === 0);
+      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0);
   }
 
   _isAvailable(account) {
