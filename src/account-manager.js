@@ -639,14 +639,15 @@ export class AccountManager {
       this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
       // Convergence cap: against the real upstream one probe fully measures an
       // account (responses always carry both window families), but a
-      // pathological upstream — a 2xx missing a family, or header-less
-      // responses — must not be probed every interval forever. A probe that
-      // completes without fully measuring the account increments
-      // _partialProbes (network failures don't count — transient); after
-      // maxWarmupTries fruitless probes the account stops being a candidate.
-      // The counter resets when a window is swept (a fresh rollover is a fresh
-      // reason to probe) or when the account becomes fully measured, so the
-      // documented "re-measure after a window reset" recovery is preserved.
+      // pathological upstream — a 2xx missing a family, header-less responses,
+      // or a deterministic 4xx — must not be probed every interval forever. A
+      // probe that completes with such a deterministic fruitless outcome
+      // increments _partialProbes (transient 5xx/429/network failures don't
+      // count — see warmupAccount); after maxWarmupTries fruitless probes the
+      // account stops being a candidate. The counter resets when a window is
+      // swept (a fresh rollover is a fresh reason to probe) or when the
+      // account becomes fully measured, so the documented "re-measure after a
+      // window reset" recovery is preserved.
       && (a._partialProbes || 0) < this.maxWarmupTries);
   }
 

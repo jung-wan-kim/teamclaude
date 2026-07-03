@@ -178,12 +178,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         if (accountManager._fullyMeasured(account)) account._partialProbes = 0;
         else account._partialProbes = (account._partialProbes || 0) + 1;
         console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
-      } else if (accountManager.accounts[account.index] === account) {
-        // The probe COMPLETED but taught nothing — a header-less 2xx, or a
-        // non-exhaustion error status. Count it toward the convergence cap so
-        // a pathological upstream is not probed every interval forever.
-        // Network failures (the catch below) stay uncounted: they are
-        // transient and must not burn the retry budget.
+      } else if (accountManager.accounts[account.index] === account
+          && (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429))) {
+        // The probe COMPLETED with a DETERMINISTIC fruitless outcome — a 2xx
+        // with no rate-limit headers (contract violation that will repeat), or
+        // a 4xx (bad shape / revoked auth — same next time). Count it toward
+        // the convergence cap so such an upstream/account is not probed every
+        // interval forever. Transient trouble — 5xx, a non-exhaustion 429, or
+        // a network failure (the catch below) — is deliberately NOT counted: a
+        // fully unmeasured account has no reset timestamp, so no sweep would
+        // ever clear its counter, and counting a passing blip would abandon it
+        // permanently even after upstream recovers.
         account._partialProbes = (account._partialProbes || 0) + 1;
       }
     } catch (err) {

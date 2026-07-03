@@ -170,6 +170,47 @@ test('a header-less 2xx upstream stops being probed after the cap', async () => 
   }
 });
 
+// Regression (review finding): transient 5xx probe outcomes must NOT burn the
+// convergence budget — a fully unmeasured account has no reset timestamp, so
+// no sweep would ever clear its counter, and a passing upstream blip would
+// abandon it permanently even after recovery.
+test('transient 5xx probe failures do not burn the budget — recovery re-measures', async () => {
+  let probeFails = 0;
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    const isProbe = raw.includes('"max_tokens":1');
+    if (isProbe && probeFails < 4) {              // more blips than maxWarmupTries
+      probeFails++;
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end('{"err":"overloaded"}');
+      return;
+    }
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 20 });
+  const proxyPort = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    // 4 probes hit 503 (uncounted), then upstream recovers → the next interval
+    // probe fully measures the account. With 5xx counted this would have
+    // stopped for good at 3 attempts.
+    assert.equal(await waitFor(() => measured(am, 'a1'), 4000), true,
+      'account measured after upstream recovered');
+    assert.equal(am.accounts[1]._partialProbes || 0, 0, 'budget untouched by transient blips');
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => upstream.close(r));
+  }
+});
+
 // ── unit: the periodic timer sweeps rolled-over windows on an idle proxy ────
 
 test('the periodic warm-up timer sweeps rolled-over windows even with no traffic', async () => {
