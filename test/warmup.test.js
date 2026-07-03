@@ -211,6 +211,31 @@ test('transient 5xx probe failures do not burn the budget — recovery re-measur
   }
 });
 
+// Regression (review findings): warm-up budget recovery paths.
+test('a rollover sweep renews BOTH warm-up budgets (_partialProbes and _warmupTries)', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const a = am.accounts[0];
+  a.quota.unified5h = 0.5;
+  a.quota.unified5hReset = Date.now() - 1000;   // rolled over
+  a._partialProbes = 3;
+  a._warmupTries = 3;                            // passive warm-up budget spent too
+  am.sweepExpired();
+  assert.equal(a._partialProbes, 0, 'active probe budget renewed');
+  assert.equal(a._warmupTries, 0, 'passive request-routing warm-up budget renewed');
+  assert.equal(am._isWarmupTarget(a), true, 'fresh window → passive warm-up target again');
+});
+
+test('a capped unmeasured account is retried after probeRetryAfterMs (slow backstop)', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const a = am.accounts[0];                      // fully unmeasured — no timestamps to sweep
+  a._partialProbes = 3;
+  a._lastFruitlessProbeAt = Date.now();          // just failed → excluded
+  assert.deepEqual(am.warmupCandidates(), [], 'freshly capped account not probed');
+  a._lastFruitlessProbeAt = Date.now() - am.probeRetryAfterMs - 1000;  // window elapsed
+  assert.deepEqual(am.warmupCandidates().map(x => x.name), ['a0'],
+    'retried once per window so a transient-looking outage recovers without a restart');
+});
+
 // ── unit: the periodic timer sweeps rolled-over windows on an idle proxy ────
 
 test('the periodic warm-up timer sweeps rolled-over windows even with no traffic', async () => {

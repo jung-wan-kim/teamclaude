@@ -75,6 +75,12 @@ export class AccountManager {
     this.reevalIntervalMs = reevalIntervalMs;
     this.lastEvalAt = 0; // 0 forces a priority pick on the first request
     this.maxWarmupTries = 3; // give up warming an account after this many unmeasured attempts
+    // Slow retry backstop for the active warm-up convergence cap: a capped
+    // account (deterministic fruitless probes) is retried once per this window,
+    // so an upstream that only LOOKED deterministic (e.g. temporarily
+    // header-less) recovers without a restart, while a truly pathological one
+    // costs at most one probe per window.
+    this.probeRetryAfterMs = 15 * 60 * 1000;
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
     // Soft connection→account affinity (keyed by the client socket). Keeps one
@@ -646,9 +652,13 @@ export class AccountManager {
       // count — see warmupAccount); after maxWarmupTries fruitless probes the
       // account stops being a candidate. The counter resets when a window is
       // swept (a fresh rollover is a fresh reason to probe) or when the
-      // account becomes fully measured, so the documented "re-measure after a
-      // window reset" recovery is preserved.
-      && (a._partialProbes || 0) < this.maxWarmupTries);
+      // account becomes fully measured — and, because a fully UNMEASURED
+      // account has no reset timestamp for the sweep to fire on, a capped
+      // account is retried once per probeRetryAfterMs as a slow backstop, so a
+      // "deterministic-looking" outage (e.g. headers temporarily missing) still
+      // recovers instead of suppressing active warm-up until a restart.
+      && ((a._partialProbes || 0) < this.maxWarmupTries
+        || Date.now() - (a._lastFruitlessProbeAt || 0) >= this.probeRetryAfterMs));
   }
 
   _isAvailable(account) {
@@ -687,14 +697,19 @@ export class AccountManager {
       if (q.unified5h != null) console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
-      account._partialProbes = 0; // fresh rollover → half-measured re-probes allowed again
+      // Fresh rollover → BOTH warm-up budgets renew: active probes
+      // (_partialProbes) and the passive request-routing warm-up
+      // (_warmupTries) get a fresh reason to re-measure this window.
+      account._partialProbes = 0;
+      account._warmupTries = 0;
     }
     if (q.unified7dReset && now >= q.unified7dReset) {
       if (q.unified7d != null) console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
-      account._partialProbes = 0; // fresh rollover → half-measured re-probes allowed again
+      account._partialProbes = 0; // fresh rollover → re-probes allowed again
+      account._warmupTries = 0;
     }
     // Clear expired model-scoped weekly windows (display-only, but a stale
     // "94% Fable" bar after the window reset would mislead)

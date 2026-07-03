@@ -175,8 +175,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // Convergence accounting: a probe that leaves the account fully
         // measured resets the fruitless-probe counter; one that leaves it
         // half-measured (a header family missing) counts toward the cap.
-        if (accountManager._fullyMeasured(account)) account._partialProbes = 0;
-        else account._partialProbes = (account._partialProbes || 0) + 1;
+        if (accountManager._fullyMeasured(account)) {
+          account._partialProbes = 0;
+        } else {
+          account._partialProbes = (account._partialProbes || 0) + 1;
+          account._lastFruitlessProbeAt = Date.now(); // paces the slow retry backstop
+        }
         console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
       } else if (accountManager.accounts[account.index] === account
           && (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429))) {
@@ -190,6 +194,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // ever clear its counter, and counting a passing blip would abandon it
         // permanently even after upstream recovers.
         account._partialProbes = (account._partialProbes || 0) + 1;
+        account._lastFruitlessProbeAt = Date.now(); // paces the slow retry backstop
       }
     } catch (err) {
       // Best-effort: leave the account unmeasured (exactly as before warm-up).
