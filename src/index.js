@@ -643,7 +643,16 @@ async function statusCommand() {
       if (q.unified5h != null || q.unified7d != null) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        console.log(`    Session:  ${ses} used    Weekly: ${wk} used`);
+        let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
+        // Model-scoped weekly windows (7d_oi = the Fable weekly limit). Guarded
+        // with ?. so a status from an older running server (no modelWeekly
+        // field) still prints. Unknown labels print as-is.
+        for (const [label, w] of Object.entries(q.modelWeekly ?? {})) {
+          if (w?.utilization == null) continue;
+          const name = label === '7d_oi' ? 'Fable wk' : label;
+          line += `    ${name}: ${(w.utilization * 100).toFixed(1)}% used`;
+        }
+        console.log(line);
       } else {
         const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
         const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
@@ -872,15 +881,16 @@ async function setPriorityCommand() {
   const name = args[1];
   const raw = args[2];
   if (!name || raw === undefined) {
-    console.error('Usage: teamclaude priority <account-name> <number|clear>');
-    console.error('  Lower number = preferred first. Use "clear" to remove the priority.');
+    console.error('Usage: teamclaude priority <account-name> <number|auto>');
+    console.error('  Lower number = preferred first. Use "auto" (or "clear") to return the');
+    console.error('  account to automatic ordering: weekly reset soonest is drained first.');
     process.exit(1);
   }
-  const clearing = raw === 'clear' || raw === 'none' || raw === 'null';
+  const clearing = raw === 'auto' || raw === 'clear' || raw === 'none' || raw === 'null';
   let value = null;
   if (!clearing) {
     const n = Number(raw);
-    if (!Number.isFinite(n)) { console.error(`Invalid priority "${raw}" — expected a number or "clear"`); process.exit(1); }
+    if (!Number.isFinite(n)) { console.error(`Invalid priority "${raw}" — expected a number or "auto"`); process.exit(1); }
     value = Math.floor(n);
   }
   let found = false;
@@ -890,7 +900,7 @@ async function setPriorityCommand() {
   });
   if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
   console.log(clearing
-    ? `Cleared priority for "${name}" (back to use-or-lose ordering)`
+    ? `Set "${name}" to auto (use-or-lose ordering: weekly reset soonest first)`
     : `Set priority of "${name}" to ${value} (lower = preferred first)`);
   await noteRunningServerReload(config);
 }
@@ -916,7 +926,8 @@ Commands:
   remove <name>       Remove an account
   disable <name>      Disable an account (excluded from rotation)
   enable <name>       Re-enable a disabled account
-  priority <name> <n> Set selection priority (lower = preferred; "clear" to reset)
+  priority <name> <n> Set selection priority (lower = preferred; "auto" to return
+                      to automatic ordering — weekly reset soonest drained first)
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 

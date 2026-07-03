@@ -134,6 +134,25 @@ test('order mode: ↑ moves the grabbed account and the selection follows it', (
   assert.equal(tui._displayList()[tui.selIdx], am.accounts[2], 'selection stays on the moved account');
 });
 
+test('order mode: "a" un-ranks the grabbed account back to auto in one keypress', () => {
+  const { tui, am, config } = makeTUI(['a0', 'a1', 'a2']);
+  tui._moveOrder(am.accounts[0], -1);            // a0 #1
+  tui._moveOrder(am.accounts[1], -1);            // a1 #2
+  assert.deepEqual(am.accounts.map(a => a.priority), [0, 1, null]);
+
+  tui.orderAccount = am.accounts[0];
+  tui.mode = 'order';
+  tui._keyOrder('a');                             // a0 → auto
+  assert.equal(am.accounts[0].priority, null, 'a0 back to auto (use-or-lose)');
+  assert.equal(am.accounts[1].priority, 0, 'remaining ranked renumbered contiguously');
+  assert.equal(config.accounts[0].priority, null, 'persisted null so a stale disk value cannot survive');
+  assert.equal(tui.mode, 'order', 'stays in order mode (Enter/Esc to finish)');
+  assert.equal(tui._displayList()[tui.selIdx], am.accounts[0], 'selection follows the account');
+
+  tui._keyOrder('a');                             // already auto → harmless no-op
+  assert.equal(am.accounts[0].priority, null);
+});
+
 // ── normalization of legacy / duplicate priority values ─────────────────────
 
 test('duplicate / legacy priority values render as distinct positions and normalize on a move', async () => {
@@ -178,6 +197,47 @@ test('generated api names are collision-free after a delete (no duplicate)', asy
   const names = config.accounts.map(a => a.name).sort();
   assert.equal(new Set(names).size, names.length, 'no duplicate account names');
   assert.deepEqual(names, ['api-1', 'api-2']);
+});
+
+// ── model-scoped weekly (Fable) quota bar ────────────────────────────────────
+
+const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+test('a wide row renders a third "Fbl" bar for an OAuth account', () => {
+  const am = new AccountManager([
+    { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0, 5);
+  const now = Date.now();
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.54',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 3600_000) / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': '0.73',
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((now + 86400_000) / 1000)),
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.94',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 86400_000) / 1000)),
+  });
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+
+  const wide = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
+  assert.match(wide, /Ses .*Wk .*Fbl .*94%/s, 'third bar labelled Fbl with the 7d_oi utilization');
+
+  const mid = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false));
+  assert.doesNotMatch(mid, /Fbl/, 'no third bar on mid widths');
+});
+
+test('an unmeasured Fable window renders an empty Fbl bar; API-key rows pad the slot', () => {
+  const am = new AccountManager([
+    { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'api-1', type: 'apikey', apiKey: 'sk-1' },
+  ], 0.98, 0, 5);
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+
+  const oauthRow = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
+  assert.match(oauthRow, /Fbl/, 'OAuth row always shows the Fbl label (with "-" until measured)');
+
+  const apiRow = stripAnsi(tui._renderAcct(am.accounts[1], 1, 10, true, true));
+  assert.doesNotMatch(apiRow, /Fbl/, 'API-key accounts have no Fable window');
+  assert.equal(oauthRow.length, apiRow.length, 'slot padded so columns stay aligned');
 });
 
 // ── enable/disable (unchanged) ──────────────────────────────────────────────

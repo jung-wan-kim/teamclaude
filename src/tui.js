@@ -275,6 +275,12 @@ export class TUI {
     } else if (k === 'down' || k === 'j') {
       this._moveOrder(this.orderAccount, +1);
       this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
+    } else if (k === 'a') {
+      // Auto: un-rank the grabbed account in one keypress (instead of moving it
+      // down past the bottom of the ranked group) — back to automatic
+      // use-or-lose routing (weekly reset soonest first).
+      this._setAutoOrder(this.orderAccount);
+      this.selIdx = Math.max(0, this._displayList().indexOf(this.orderAccount));
     } else if (k === 'enter' || k === 'esc' || k === 'q') {
       this.mode = 'normal'; this.orderAccount = null;
     }
@@ -498,8 +504,25 @@ export class TUI {
       else ranked.splice(r, 1);                                                    // last ranked → un-rank
     }
 
-    // Reassign contiguous priorities (ranked → its index; everyone else → null),
-    // mutating the live AccountManager and the config in lockstep.
+    this._applyRanking(ranked);
+  }
+
+  /**
+   * Un-rank an account back to "auto" (automatic use-or-lose routing: weekly
+   * reset soonest first). A no-op when it's already unranked — but the
+   * renumber below still normalizes any legacy/duplicate priorities.
+   */
+  _setAutoOrder(account) {
+    if (!this.am.accounts.includes(account)) return;
+    this._applyRanking(this._rankedSorted().filter(a => a !== account));
+  }
+
+  /**
+   * Persist a new ranked order: reassign contiguous priorities (ranked → its
+   * index; everyone else → null), mutating the live AccountManager and the
+   * config in lockstep, then schedule a coalesced save.
+   */
+  _applyRanking(ranked) {
     const set = new Set(ranked);
     for (const a of this.am.accounts) {
       const want = set.has(a) ? ranked.indexOf(a) : null;
@@ -565,14 +588,19 @@ export class TUI {
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
       lines.push('');
+      // Three quota bars (Ses / Wk / Fbl) when the terminal is wide enough,
+      // two (Ses / Wk) on mid widths, one on narrow ones.
+      const showThree = W >= 92;
       const showBoth = W >= 70;
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
+      const bw = showThree
+        ? Math.max(5, Math.min(20, Math.floor((W - 62) / 3)))
+        : showBoth
+          ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
+          : Math.max(5, Math.min(20, W - 45));
 
       const display = this._displayList();
       for (let pos = 0; pos < display.length; pos++) {
-        lines.push(this._renderAcct(display[pos], pos, bw, showBoth));
+        lines.push(this._renderAcct(display[pos], pos, bw, showBoth, showThree));
       }
     }
 
@@ -617,7 +645,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(a, pos, bw, showBoth) {
+  _renderAcct(a, pos, bw, showBoth, showThree = false) {
     const isCur = a === this.am.accounts[this.am.currentIndex];
     // Highlight the selection in both select and order modes; in order mode the
     // grabbed account gets a distinct move marker.
@@ -657,12 +685,24 @@ export class TUI {
     // (unified5h != null) mislabels an unmeasured OAuth account as Tok/Req.
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    let r3 = null, l3 = null, t3 = null;
 
     if (a.type === 'oauth') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
+      // Third bar: the model-scoped weekly window (7d_oi — the top-model weekly
+      // limit shown as "Fable" in Claude's usage UI). Unknown window labels
+      // still render, tagged by their suffix, so a renamed header keeps showing.
+      const mw = q.modelWeekly && Object.entries(q.modelWeekly)[0];
+      l3 = 'Fbl';
+      if (mw) {
+        const [label, win] = mw;
+        if (label !== '7d_oi') l3 = (label.slice(3) + '   ').slice(0, 3);
+        r3 = win.utilization;
+        t3 = win.reset;
+      }
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -677,6 +717,11 @@ export class TUI {
     let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
+    }
+    if (showThree) {
+      // API-key accounts have no third metric — pad the slot so the rank
+      // badges stay column-aligned across mixed account types.
+      line += l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(6 + bw);
     }
     // Order badge: ranked accounts show their 1-based position (#1 = most
     // preferred). While ordering, unranked accounts are labelled "auto" so the
@@ -695,7 +740,7 @@ export class TUI {
       case 'select':
         return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
       case 'order':
-        return ` ${dim('↑↓')} move (up = preferred)  ${bold('Enter')}/${bold('Esc')} done`;
+        return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto (weekly-reset order)  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':

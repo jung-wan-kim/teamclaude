@@ -18,6 +18,14 @@ function emptyQuota() {
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
+    // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
+    // the separate weekly limit for the top model tier shown as "Fable" in
+    // Claude's usage UI. Parsed generically from
+    // anthropic-ratelimit-unified-<window>-* so a renamed/added window keeps
+    // being tracked without a code change. Display-only: it never feeds
+    // availability, because an account over its Fable weekly limit still
+    // serves every other model.
+    modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
     resetsAt: null,
   };
 }
@@ -98,9 +106,10 @@ export class AccountManager {
    *    stream stays on one account and keeps Anthropic's per-account prompt
    *    cache warm.
    *
-   * Priority is "use-or-lose": soonest session reset first, then lowest
-   * session usage — so quota about to reset (and otherwise be wasted) is
-   * consumed first. Returns null if every account is exhausted.
+   * Priority is "use-or-lose": soonest WEEKLY (7d) reset first, then soonest
+   * session reset, then lowest session usage — so quota about to reset (and
+   * otherwise be wasted) is consumed first, starting with the scarcer weekly
+   * window. Returns null if every account is exhausted.
    */
   getActiveAccount(exclude = null) {
     const now = Date.now();
@@ -150,7 +159,7 @@ export class AccountManager {
       this.lastEvalAt = now;
       const best = this._selectBest();
       if (best && best.index !== this.currentIndex) {
-        console.log(`[TeamClaude] Re-prioritized to account "${best.name}" (session resets soonest)`);
+        console.log(`[TeamClaude] Re-prioritized to account "${best.name}" (weekly reset soonest)`);
         this.currentIndex = best.index;
         return best;
       }
@@ -412,9 +421,11 @@ export class AccountManager {
   }
 
   /**
-   * Highest-priority available account by use-or-lose ordering: soonest
-   * session reset first, then lowest session utilization. Falls back to the
-   * soonest-resetting account when none are currently available.
+   * Highest-priority available account by use-or-lose ordering: soonest WEEKLY
+   * (7d) reset first — weekly quota is the scarce resource, so an account whose
+   * week is about to renew (and whose unspent quota would be wasted) is drained
+   * first — then soonest session reset, then lowest session utilization. Falls
+   * back to the soonest-resetting account when none are currently available.
    *
    * `exclude` (a Set of account objects) is used for per-request failover: those
    * accounts are skipped, and when nothing else is eligible this returns null
@@ -429,9 +440,12 @@ export class AccountManager {
       const pa = this._priority(a);
       const pb = this._priority(b);
       if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
+      const wa = this._weeklyResetTime(a);
+      const wb = this._weeklyResetTime(b);
+      if (wa !== wb) return wa - wb;                                     // then soonest WEEKLY reset (drain what renews first)
       const ra = this._sessionResetTime(a);
       const rb = this._sessionResetTime(b);
-      if (ra !== rb) return ra - rb;                                     // then soonest reset
+      if (ra !== rb) return ra - rb;                                     // then soonest session reset
       return this._sessionUtilization(a) - this._sessionUtilization(b);  // then least used
     });
 
@@ -440,10 +454,12 @@ export class AccountManager {
     // pinning to the lowest index, so a startup burst can't pile onto one account
     // before quotas are known.
     const p0 = this._priority(eligible[0]);
+    const w0 = this._weeklyResetTime(eligible[0]);
     const r0 = this._sessionResetTime(eligible[0]);
     const u0 = this._sessionUtilization(eligible[0]);
     const tied = eligible
       .filter(a => this._priority(a) === p0
+        && this._weeklyResetTime(a) === w0
         && this._sessionResetTime(a) === r0
         && this._sessionUtilization(a) === u0)
       .sort((a, b) => a.index - b.index);
@@ -461,6 +477,15 @@ export class AccountManager {
    */
   _priority(account) {
     return Number.isFinite(account.priority) ? account.priority : Infinity;
+  }
+
+  /**
+   * Weekly reset timestamp (ms): unified 7d (Max) → Infinity. API-key accounts
+   * have no weekly window, so they tie at Infinity and the session tiebreak
+   * decides — exactly the pre-weekly-ordering behavior.
+   */
+  _weeklyResetTime(account) {
+    return account.quota.unified7dReset || Infinity;
   }
 
   /** Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity. */
@@ -597,6 +622,14 @@ export class AccountManager {
       q.unified7dReset = null;
       q.unifiedStatus = null;
     }
+    // Clear expired model-scoped weekly windows (display-only, but a stale
+    // "94% Fable" bar after the window reset would mislead)
+    for (const [label, win] of Object.entries(q.modelWeekly)) {
+      if (win.reset && now >= win.reset) {
+        console.log(`[TeamClaude] Account "${account.name}" ${label} quota reset`);
+        delete q.modelWeekly[label];
+      }
+    }
 
     // Clear expired standard quotas
     if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
@@ -675,6 +708,25 @@ export class AccountManager {
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) account.quota.unifiedStatus = uStatus;
+
+    // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
+    // for the top model tier ("Fable" in Claude's usage UI). These headers only
+    // appear on responses to requests for that model tier, so the value sticks
+    // around from the last such request. Matched generically so a renamed or
+    // newly added window is picked up as-is.
+    for (const [key, value] of Object.entries(headers)) {
+      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset)$/.exec(key);
+      if (!m) continue;
+      const win = account.quota.modelWeekly[m[1]]
+        || (account.quota.modelWeekly[m[1]] = { utilization: null, reset: null });
+      if (m[2] === 'utilization') {
+        const u = parseFloat(value);
+        if (!isNaN(u)) win.utilization = u;
+      } else {
+        const r = parseInt(value, 10);
+        if (!isNaN(r)) win.reset = r * 1000;
+      }
+    }
 
     // Standard rate limits (API key accounts)
     const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
@@ -940,12 +992,15 @@ export class AccountManager {
 
   /**
    * Is account `a` strictly preferred over `b` by the same lexicographic order
-   * `_selectBest` sorts on: explicit priority (lower first), then soonest session
-   * reset, then lowest utilization. Returns false when they rank equal (a tie).
+   * `_selectBest` sorts on: explicit priority (lower first), then soonest weekly
+   * reset, then soonest session reset, then lowest utilization. Returns false
+   * when they rank equal (a tie).
    */
   _strictlyPrefer(a, b) {
     const pa = this._priority(a), pb = this._priority(b);
     if (pa !== pb) return pa < pb;
+    const wa = this._weeklyResetTime(a), wb = this._weeklyResetTime(b);
+    if (wa !== wb) return wa < wb;
     const ra = this._sessionResetTime(a), rb = this._sessionResetTime(b);
     if (ra !== rb) return ra < rb;
     return this._sessionUtilization(a) < this._sessionUtilization(b);
@@ -964,7 +1019,13 @@ export class AccountManager {
         status: a.status,
         enabled: a.enabled !== false,
         priority: a.priority ?? null,
-        quota: { ...a.quota },
+        // Deep-copy the nested modelWeekly map — the shallow quota spread would
+        // otherwise hand callers a live reference into account state.
+        quota: {
+          ...a.quota,
+          modelWeekly: Object.fromEntries(
+            Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+        },
         usage: { ...a.usage },
         inflight: a.inflight,
         maxConcurrent: a.maxConcurrent,

@@ -20,12 +20,53 @@ function setSession(am, idx, util, resetInMs, now = Date.now()) {
   am.accounts[idx].quota.unified5hReset = now + resetInMs;
 }
 
+function setWeekly(am, idx, util, resetInMs, now = Date.now()) {
+  am.accounts[idx].quota.unified7d = util;
+  am.accounts[idx].quota.unified7dReset = now + resetInMs;
+}
+
 test('use-or-lose: account whose session resets soonest is chosen first', () => {
   const am = new AccountManager(makeAccounts(3), 0.98);
   setSession(am, 0, 0.10, 4 * HOUR);   // far reset, low usage
   setSession(am, 1, 0.50, 5 * MIN);    // soon reset, mid usage  ← should win
   setSession(am, 2, 0.05, 3 * HOUR);   // far reset, lowest usage
   assert.equal(am.getActiveAccount().name, 'acct-1');
+});
+
+test('use-or-lose: soonest WEEKLY reset wins over soonest session reset', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const now = Date.now();
+  // acct-0: session resets very soon, but its week renews far out.
+  setSession(am, 0, 0.20, 5 * MIN, now);
+  setWeekly(am, 0, 0.40, 6 * 24 * HOUR, now);
+  // acct-1: session resets later, but its week renews tomorrow — its unspent
+  // weekly quota is about to be wasted, so it must be drained first.
+  setSession(am, 1, 0.20, 4 * HOUR, now);
+  setWeekly(am, 1, 0.40, 1 * 24 * HOUR, now);
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+});
+
+test('weekly tie → session reset decides (accounts without 7d data unchanged)', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const now = Date.now();
+  const wkReset = 3 * 24 * HOUR;
+  setSession(am, 0, 0.20, 4 * HOUR, now);
+  setWeekly(am, 0, 0.40, wkReset, now);
+  setSession(am, 1, 0.20, 5 * MIN, now);   // same weekly reset → soonest session wins
+  setWeekly(am, 1, 0.40, wkReset, now);
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+});
+
+test('explicit priority still beats weekly ordering', () => {
+  const accts = makeAccounts(2);
+  accts[0].priority = 0;                    // pinned #1
+  const am = new AccountManager(accts, 0.98);
+  const now = Date.now();
+  setSession(am, 0, 0.20, 4 * HOUR, now);
+  setWeekly(am, 0, 0.40, 6 * 24 * HOUR, now);   // far weekly reset
+  setSession(am, 1, 0.20, 5 * MIN, now);
+  setWeekly(am, 1, 0.40, 1 * 24 * HOUR, now);   // near weekly reset — loses to the pin
+  assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
 test('tie on reset time → lowest utilization wins', () => {
@@ -193,4 +234,65 @@ test('a header-less response does not trap an account as permanently unmeasured'
   measure(am, 1, 0.10, 5 * MIN, now);
   assert.equal(am._isMeasured(am.accounts[1]), true);
   assert.equal(am.getActiveAccount().name, 'acct-1');
+});
+
+// ── model-scoped weekly windows (7d_oi — the "Fable" weekly limit) ────────────
+
+test('updateQuota parses model-scoped weekly windows (7d_oi) generically', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  const resetSec = Math.floor((now + 4 * 24 * HOUR) / 1000);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.54',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + HOUR) / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': '0.86',
+    'anthropic-ratelimit-unified-7d-reset': String(resetSec),
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.94',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(resetSec),
+    'anthropic-ratelimit-unified-7d_oi-status': 'allowed_warning',
+  });
+  const win = am.accounts[0].quota.modelWeekly['7d_oi'];
+  assert.equal(win.utilization, 0.94);
+  assert.equal(win.reset, resetSec * 1000, 'reset normalized to ms');
+  // The plain 7d window is untouched by the model-scoped one.
+  assert.equal(am.accounts[0].quota.unified7d, 0.86);
+});
+
+test('a model-scoped weekly limit over threshold does NOT make the account unavailable', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.30',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + HOUR) / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': '0.50',
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
+    // Fable weekly exhausted — the account still serves every other model.
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1.01',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
+  });
+  assert.equal(am._isAvailable(am.accounts[0]), true);
+  assert.equal(am.getActiveAccount().name, 'acct-0');
+});
+
+test('an expired model-scoped weekly window is cleared lazily', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  setSession(am, 0, 0.30, 4 * HOUR, now);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: now - 1000 };
+  am.getActiveAccount();               // runs _isNearQuota → lazy expiry sweep
+  assert.deepEqual(am.accounts[0].quota.modelWeekly, {}, 'stale window removed after its reset passed');
+});
+
+test('getStatus exposes modelWeekly as a detached copy', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.94',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
+  });
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94);
+  status.accounts[0].quota.modelWeekly['7d_oi'].utilization = 0;
+  assert.equal(am.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94,
+    'mutating the snapshot must not reach live account state');
 });

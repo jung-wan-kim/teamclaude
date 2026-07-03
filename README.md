@@ -8,7 +8,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ## Features
 
-- **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose session (5h) quota resets soonest (then lowest usage), re-evaluating every 5 minutes; switches immediately when the active account reaches the quota threshold (default 98%)
+- **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) fails the request over to another account so concurrent overflow spreads instead of erroring. Either way nothing blocks, and a request-global 429 only passes through after every account has been tried — never throttling the fleet
 - **Interactive TUI** — real-time dashboard with color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
@@ -91,7 +91,7 @@ teamclaude server
 ```
 
 When running from a TTY, shows an interactive TUI with:
-- Account table with session/weekly quota progress bars (usage % overlaid, plus a reset countdown when space allows)
+- Account table with session/weekly quota progress bars (usage % overlaid, plus a reset countdown when space allows); wide terminals add a third `Fbl` bar with the model-scoped weekly limit (the separate "Fable" weekly limit from Claude's usage UI)
 - Real-time activity log with request tracking
 - Keyboard shortcuts (see below)
 
@@ -103,9 +103,12 @@ If the configured port is already in use — for example another TeamClaude prox
 
 | Key | Action |
 |-----|--------|
-| `s` | Switch active account |
+| `↑`/`↓` | Move the selection cursor over the accounts |
+| `s` | Switch active account (to the selected one) |
+| `e` | Enable / disable the selected account |
+| `o` | Order the selected account: `↑`/`↓` move its rank, `a` returns it to `auto` (weekly-reset ordering) |
 | `a` | Add account (import or API key) |
-| `d` | Delete an account |
+| `d` | Delete an account (with confirmation) |
 | `R` | Reload accounts from config |
 | `q` | Quit |
 
@@ -189,8 +192,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose session quota resets soonest (tie-break: lowest usage), so quota about to reset isn't wasted. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min; set `0` to disable timer-based switching), and on reaching the threshold it switches immediately to the next-highest-priority account
+4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization. Model-scoped weekly windows (`7d_oi` — the separate "Fable" weekly limit) are tracked and displayed too, but never affect routing: an account over its Fable weekly limit still serves every other model
+5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose weekly (7d) quota resets soonest (tie-breaks: soonest session reset, then lowest usage), so quota about to renew unused is drained first. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min; set `0` to disable timer-based switching), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On a 429 the proxy classifies it (never sleeping holding the client connection):
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
    - **Rate/concurrency or transient 429** (account has token quota left but was hit too fast, or a transient limit) → the request fails over to another available account (per-request, without throttling the account), so concurrent overflow spreads to an idle account instead of erroring. If *every* account has been tried for the request (→ effectively global), the 429 is passed through — still without throttling any account, so the fleet isn't poisoned.
