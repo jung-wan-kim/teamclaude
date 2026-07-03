@@ -339,6 +339,23 @@ test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a
   assert.equal(am2.accounts[1].usage.totalRequests, 1, 'usage counters carried over');
 });
 
+// Regression (review finding): unifiedStatus is a per-response signal that
+// isExhausted() reads as "this 429 is account exhaustion". A stale 'rejected'
+// restored from a snapshot would misclassify a later transient/headerless 429
+// as exhaustion and wrongly throttle the account.
+test('importQuotaState never restores unifiedStatus (stale rejected must not classify future 429s)', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  am.importQuotaState([{
+    name: 'acct-0',
+    quota: { unified5h: 0.1, unified5hReset: now + HOUR, unifiedStatus: 'rejected' },
+  }]);
+  assert.equal(am.accounts[0].quota.unified5h, 0.1, 'quota values restored');
+  assert.equal(am.accounts[0].quota.unifiedStatus, null, 'stale unifiedStatus dropped');
+  am.updateQuota(0, {});                             // a later header-less 429's updateQuota
+  assert.equal(am.isExhausted(0), false, 'transient 429 not misclassified as exhaustion');
+});
+
 // Regression (review finding): a snapshot entry WITH a uuid must never fall
 // back to name matching — a same-name account with a different uuid is a
 // replaced account, and inheriting the old throttle would falsely 429 it.

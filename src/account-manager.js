@@ -1081,6 +1081,12 @@ export class AccountManager {
         a.quota = {
           ...emptyQuota(),
           ...s.quota,
+          // unifiedStatus is a PER-RESPONSE signal — isExhausted() treats a
+          // 'rejected' here as "this 429 is account exhaustion". Restoring a
+          // stale one would misclassify a later transient/headerless 429 as
+          // exhaustion and wrongly throttle the account. Only a live response
+          // (updateQuota) may set it.
+          unifiedStatus: null,
           modelWeekly: Object.fromEntries(
             Object.entries(s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object' ? s.quota.modelWeekly : {})
               .map(([k, w]) => [k, { ...w }])),
