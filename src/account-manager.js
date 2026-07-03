@@ -1055,8 +1055,13 @@ export class AccountManager {
   }
 
   /**
-   * Restore a quota snapshot from a previous run. Matched by accountUuid first,
-   * then name (identity keys — indexes shift); unknown entries are skipped.
+   * Restore a quota snapshot from a previous run. A snapshot entry WITH an
+   * accountUuid is matched by uuid ONLY — a same-name account with a different
+   * uuid is a *replaced* account (a different underlying identity), and
+   * restoring the old quota/throttle onto it would falsely mark a fresh
+   * account near-quota or throttled. Name matching is the fallback solely for
+   * entries without a uuid (API-key accounts, whose identity key is the name).
+   * Unknown entries are skipped (→ unmeasured, exactly the pre-restore state).
    * Values may be slightly stale, but the proxy takes no traffic while it's
    * down, and expired windows are lazily swept by _isNearQuota on first use —
    * so a restore is strictly better than starting blind. A still-future
@@ -1066,8 +1071,9 @@ export class AccountManager {
   importQuotaState(saved) {
     for (const s of Array.isArray(saved) ? saved : []) {
       if (!s || typeof s !== 'object') continue;
-      const a = (s.accountUuid && this.accounts.find(x => x.accountUuid === s.accountUuid))
-        || this.accounts.find(x => x.name === s.name);
+      const a = s.accountUuid
+        ? this.accounts.find(x => x.accountUuid === s.accountUuid)
+        : this.accounts.find(x => x.name === s.name);
       if (!a) continue;
       if (s.quota && typeof s.quota === 'object') {
         // Merge over emptyQuota so a cache written by an older version (missing

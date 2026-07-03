@@ -339,6 +339,22 @@ test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a
   assert.equal(am2.accounts[1].usage.totalRequests, 1, 'usage counters carried over');
 });
 
+// Regression (review finding): a snapshot entry WITH a uuid must never fall
+// back to name matching — a same-name account with a different uuid is a
+// replaced account, and inheriting the old throttle would falsely 429 it.
+test('importQuotaState does not restore state onto a replaced (same-name, new-uuid) account', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  am.accounts[0].accountUuid = 'uuid-new';
+  am.importQuotaState([{
+    accountUuid: 'uuid-old', name: 'acct-0',           // same name, different identity
+    quota: { unified5h: 0.99, unified5hReset: now + HOUR },
+    rateLimitedUntil: now + 60_000,
+  }]);
+  assert.equal(am.accounts[0].quota.unified5h, null, 'replaced account starts unmeasured');
+  assert.equal(am.accounts[0].status, 'active', 'old throttle NOT inherited');
+});
+
 test('importQuotaState skips unknown accounts, expired throttles, and tolerates an old cache shape', () => {
   const now = Date.now();
   const am = new AccountManager(makeAccounts(1), 0.98);
