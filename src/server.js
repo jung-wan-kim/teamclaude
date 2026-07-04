@@ -1088,13 +1088,16 @@ function extractUsageFromBody(buffer, account, accountManager) {
 // *why* each account is currently unusable — so an all-exhausted fleet tells the
 // client the real (often hours-long) wait instead of a flat 60s it would just
 // re-flood against every minute:
-//   - an explicit throttle (a live exhaustion 429 → markRateLimited) frees at
-//     `rateLimitedUntil`;
-//   - an account over its measured quota frees once every window it is currently
-//     past `threshold` on has reset (the latest of them) — for a Max account
-//     that's the unified 5h/7d reset the dashboard shows, NOT `resetsAt` (a
-//     standard/API-key-only field the old code looked at, so a utilization-
-//     exhausted Max fleet always fell through to the 60s default).
+// An account is usable again only once BOTH its throttle AND every quota window
+// it is currently past `threshold` on have cleared — so we take the LATEST (max)
+// of them per account:
+//   - an explicit throttle (a live exhaustion 429 → markRateLimited) is clamped
+//     to <=5m, but the binding 5h/7d window that 429 came with may reset hours
+//     later; the account stays `_isNearQuota` until then, so returning the
+//     throttle alone made the client re-flood every 5 min while still exhausted;
+//   - the quota reset is the unified 5h/7d reset the dashboard shows, NOT
+//     `resetsAt` (a standard/API-key-only field the old code looked at, so a
+//     utilization-exhausted Max fleet always fell through to the 60s default).
 // A window UNDER threshold is not binding, so its (always-future) reset is
 // ignored: that stops a merely concurrency-capped but otherwise healthy account
 // (a slot frees in seconds) from inflating the wait to hours. Disabled/auth-error
@@ -1106,12 +1109,12 @@ function computeRetryAfter(accounts, threshold = 0.98) {
   const consider = ms => { if (ms > 0 && ms < soonest) soonest = ms; };
   for (const acct of accounts) {
     if (acct.enabled === false || acct.status === 'error') continue;
-    if (acct.rateLimitedUntil) {
-      consider(new Date(acct.rateLimitedUntil).getTime() - now);
-      continue;
-    }
-    const q = acct.quota || {};
+    // freeAt = max(throttle, every over-threshold quota reset). The account is
+    // blocked until the LAST of these clears; taking the min across accounts
+    // then gives the soonest the fleet has anything to serve.
     let freeAt = 0;
+    if (acct.rateLimitedUntil) freeAt = Math.max(freeAt, new Date(acct.rateLimitedUntil).getTime());
+    const q = acct.quota || {};
     if (q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
       freeAt = Math.max(freeAt, q.unified5hReset);
     if (q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)

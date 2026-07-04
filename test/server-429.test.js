@@ -254,3 +254,39 @@ test('all-capped-but-healthy → 429 retry-after stays short (reset under thresh
     proxy.close();
   }
 });
+
+// Regression (adversarial review): an account both THROTTLED (rateLimitedUntil,
+// clamped to <=5m by the exhaustion-429 path) AND over its utilization threshold
+// with a far-off reset is only usable once the LATER of the two clears. Returning
+// the shorter throttle made the client re-flood every 5 min while the account was
+// still quota-exhausted. retry-after must track max(throttle, binding reset).
+test('throttled AND utilization-exhausted → retry-after waits for the later reset, not the 5m throttle', async () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const throttleMs = Date.now() + 300_000;   // 5-min throttle clamp
+  const resetMs = Date.now() + 3600_000;     // real 5h reset ~1h out
+  for (const acct of am.accounts) {
+    acct.status = 'throttled';
+    acct.rateLimitedUntil = throttleMs;
+    acct.quota.unified5h = 0.995;
+    acct.quota.unified5hReset = resetMs;
+  }
+  const proxy = startProxy(am, 0);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429);
+    const ra = parseInt(res.headers.get('retry-after'), 10);
+    assert.ok(ra > 3000 && ra <= 3600, `should wait for the 5h reset (~3600), not the 300s throttle, got ${ra}s`);
+  } finally {
+    proxy.close();
+  }
+});
