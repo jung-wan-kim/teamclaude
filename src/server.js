@@ -1099,10 +1099,12 @@ function extractUsageFromBody(buffer, account, accountManager) {
 //     `resetsAt` (a standard/API-key-only field the old code looked at, so a
 //     utilization-exhausted Max fleet always fell through to the 60s default).
 // A window UNDER threshold is not binding, so its (always-future) reset is
-// ignored: that stops a merely concurrency-capped but otherwise healthy account
-// (a slot frees in seconds) from inflating the wait to hours. Disabled/auth-error
-// accounts never return on a timer, so they're skipped. Falls back to 60s when
-// nothing has a known reset (e.g. every account is only cap-saturated).
+// ignored — and an account with NO binding constraint at all (quota-healthy,
+// merely concurrency-capped or overflow-queued) contributes a short 60s
+// candidate instead: its slot frees in seconds, so one healthy account caps the
+// whole fleet's wait at the short fallback even when every other account is
+// hours from reset. Disabled/auth-error accounts never return on a timer, so
+// they're skipped. Falls back to 60s when nothing contributes anything.
 function computeRetryAfter(accounts, threshold = 0.98) {
   const now = Date.now();
   let soonest = Infinity;
@@ -1132,6 +1134,7 @@ function computeRetryAfter(accounts, threshold = 0.98) {
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
     if (freeAt > 0) consider(freeAt - now);
+    else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }

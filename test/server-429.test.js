@@ -367,3 +367,42 @@ test('token window expired but request window still blocked → account stays un
     proxy.close();
   }
 });
+
+// Regression (adversarial review round 4): a MIXED fleet — one account exhausted
+// for hours, another quota-healthy but momentarily at its concurrency cap — must
+// NOT tell the client to wait for the exhausted account's reset. The healthy
+// account's slot frees in seconds, so it caps the fleet wait at the short
+// fallback (60s).
+test('mixed exhausted + healthy-capped fleet → retry-after stays short, not the exhausted reset', async () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 5 * 60 * 1000, 1); // maxConcurrentPerAccount = 1
+  // A: exhausted, resets in ~1h. B: healthy (10%) but its only slot is taken.
+  am.accounts[0].quota.unified5h = 0.995;
+  am.accounts[0].quota.unified5hReset = Date.now() + 3600_000;
+  am.accounts[1].quota.unified5h = 0.10;
+  am.accounts[1].quota.unified5hReset = Date.now() + 3600_000;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: 'http://127.0.0.1:0',
+    activeWarmup: false,
+    overflowQueueTimeoutMs: 50, // time the queued request out fast
+  });
+  const proxyPort = await listen(proxy);
+  am.accounts[1].inflight = 1; // B capped by an in-flight request
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429);
+    const ra = parseInt(res.headers.get('retry-after'), 10);
+    assert.equal(ra, 60, `healthy-capped B should cap the wait at 60s, got ${ra}s`);
+  } finally {
+    proxy.close();
+  }
+});
