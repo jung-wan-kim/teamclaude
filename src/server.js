@@ -577,7 +577,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     ctx.status = 429;
     const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts);
+    const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -787,7 +787,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // getActiveAccount returns null before this can fire. Cap anyway.
         if (retryCount >= maxRetries) {
           ctx.status = 429;
-          const ra = computeRetryAfter(accountManager.getStatus().accounts);
+          const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold);
           if (!res.headersSent) {
             res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
             res.end(JSON.stringify({
@@ -1084,14 +1084,45 @@ function extractUsageFromBody(buffer, account, accountManager) {
   }
 }
 
-function computeRetryAfter(accounts) {
+// Seconds a client should wait before ANY account can serve again, derived from
+// *why* each account is currently unusable — so an all-exhausted fleet tells the
+// client the real (often hours-long) wait instead of a flat 60s it would just
+// re-flood against every minute:
+//   - an explicit throttle (a live exhaustion 429 → markRateLimited) frees at
+//     `rateLimitedUntil`;
+//   - an account over its measured quota frees once every window it is currently
+//     past `threshold` on has reset (the latest of them) — for a Max account
+//     that's the unified 5h/7d reset the dashboard shows, NOT `resetsAt` (a
+//     standard/API-key-only field the old code looked at, so a utilization-
+//     exhausted Max fleet always fell through to the 60s default).
+// A window UNDER threshold is not binding, so its (always-future) reset is
+// ignored: that stops a merely concurrency-capped but otherwise healthy account
+// (a slot frees in seconds) from inflating the wait to hours. Disabled/auth-error
+// accounts never return on a timer, so they're skipped. Falls back to 60s when
+// nothing has a known reset (e.g. every account is only cap-saturated).
+function computeRetryAfter(accounts, threshold = 0.98) {
+  const now = Date.now();
   let soonest = Infinity;
+  const consider = ms => { if (ms > 0 && ms < soonest) soonest = ms; };
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
-      const ms = new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
+    if (acct.enabled === false || acct.status === 'error') continue;
+    if (acct.rateLimitedUntil) {
+      consider(new Date(acct.rateLimitedUntil).getTime() - now);
+      continue;
     }
+    const q = acct.quota || {};
+    let freeAt = 0;
+    if (q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
+      freeAt = Math.max(freeAt, q.unified5hReset);
+    if (q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)
+      freeAt = Math.max(freeAt, q.unified7dReset);
+    if (q.tokensLimit != null && q.tokensRemaining != null && q.resetsAt
+        && 1 - q.tokensRemaining / q.tokensLimit >= threshold)
+      freeAt = Math.max(freeAt, new Date(q.resetsAt).getTime());
+    if (q.requestsLimit != null && q.requestsRemaining != null && q.resetsAt
+        && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
+      freeAt = Math.max(freeAt, new Date(q.resetsAt).getTime());
+    if (freeAt > 0) consider(freeAt - now);
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }
