@@ -26,7 +26,12 @@ function emptyQuota() {
     // availability, because an account over its Fable weekly limit still
     // serves every other model.
     modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
-    resetsAt: null,
+    resetsAt: null,        // soonest standard reset (session-order fallback)
+    // Token and request windows can reset at DIFFERENT times; tracked separately
+    // so retry-after can wait for whichever over-threshold window frees last
+    // (resetsAt alone collapses them, preferring the sooner token reset).
+    tokensReset: null,     // standard token-window reset (date string)
+    requestsReset: null,   // standard request-window reset (date string)
   };
 }
 
@@ -733,6 +738,8 @@ export class AccountManager {
       q.requestsRemaining = null;
       q.requestsLimit = null;
       q.resetsAt = null;
+      q.tokensReset = null;
+      q.requestsReset = null;
     }
 
     // Unified quotas (Claude Max) — utilization is already 0-1
@@ -836,6 +843,8 @@ export class AccountManager {
     if (!isNaN(requestsLimit)) account.quota.requestsLimit = requestsLimit;
     if (!isNaN(requestsRemaining)) account.quota.requestsRemaining = requestsRemaining;
 
+    if (tokensReset) account.quota.tokensReset = tokensReset;
+    if (requestsReset) account.quota.requestsReset = requestsReset;
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 

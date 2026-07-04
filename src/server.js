@@ -1119,12 +1119,18 @@ function computeRetryAfter(accounts, threshold = 0.98) {
       freeAt = Math.max(freeAt, q.unified5hReset);
     if (q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)
       freeAt = Math.max(freeAt, q.unified7dReset);
-    if (q.tokensLimit != null && q.tokensRemaining != null && q.resetsAt
+    // Standard windows reset independently — use each window's OWN reset
+    // (falling back to the collapsed resetsAt for snapshots predating the
+    // split fields), so when both are binding the LATER one wins instead of
+    // resetsAt's preference for the sooner token reset.
+    const tokensReset = q.tokensReset || q.resetsAt;
+    if (q.tokensLimit != null && q.tokensRemaining != null && tokensReset
         && 1 - q.tokensRemaining / q.tokensLimit >= threshold)
-      freeAt = Math.max(freeAt, new Date(q.resetsAt).getTime());
-    if (q.requestsLimit != null && q.requestsRemaining != null && q.resetsAt
+      freeAt = Math.max(freeAt, new Date(tokensReset).getTime());
+    const requestsReset = q.requestsReset || q.resetsAt;
+    if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
-      freeAt = Math.max(freeAt, new Date(q.resetsAt).getTime());
+      freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
     if (freeAt > 0) consider(freeAt - now);
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));

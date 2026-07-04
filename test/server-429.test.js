@@ -290,3 +290,40 @@ test('throttled AND utilization-exhausted → retry-after waits for the later re
     proxy.close();
   }
 });
+
+// Regression (adversarial review): a standard/API-key account's token and
+// request windows reset at DIFFERENT times, but resetsAt collapses them
+// (preferring the sooner token reset). With BOTH windows over threshold the
+// account only frees at the LATER reset — returning the token reset (60s here)
+// made clients re-flood every minute while the request window (1h) still
+// blocked. retry-after must use each window's own reset and take the max.
+test('API-key both windows exhausted → retry-after waits for the later window, not the sooner token reset', async () => {
+  const am = new AccountManager([
+    { name: 'k', type: 'api', apiKey: 'sk-test' },
+  ], 0.98);
+  const now = Date.now();
+  const acct = am.accounts[0];
+  acct.quota.tokensLimit = 100;
+  acct.quota.tokensRemaining = 0;      // utilization 1.0 ≥ threshold
+  acct.quota.requestsLimit = 100;
+  acct.quota.requestsRemaining = 0;    // utilization 1.0 ≥ threshold
+  acct.quota.tokensReset = new Date(now + 60_000).toISOString();     // tokens free in 60s
+  acct.quota.requestsReset = new Date(now + 3600_000).toISOString(); // requests free in 1h
+  acct.quota.resetsAt = acct.quota.tokensReset; // what updateQuota's collapse would store
+  const proxy = startProxy(am, 0);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429);
+    const ra = parseInt(res.headers.get('retry-after'), 10);
+    assert.ok(ra > 3000 && ra <= 3600, `should wait for the 1h request reset, not the 60s token reset, got ${ra}s`);
+  } finally {
+    proxy.close();
+  }
+});
