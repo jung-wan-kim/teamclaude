@@ -327,3 +327,43 @@ test('API-key both windows exhausted → retry-after waits for the later window,
     proxy.close();
   }
 });
+
+// Regression (adversarial review round 3): the expired-window sweep must clear
+// each standard window INDEPENDENTLY. Sweeping both on the collapsed resetsAt
+// (token-first) freed the account the moment the sooner token window reset,
+// even though the request window still blocked it for ~an hour — traffic then
+// flowed to an account upstream would 429. After the token reset passes, the
+// account must STAY unavailable (429 tracking the request window's reset).
+test('token window expired but request window still blocked → account stays unavailable', async () => {
+  const am = new AccountManager([
+    { name: 'k', type: 'api', apiKey: 'sk-test' },
+  ], 0.98);
+  const now = Date.now();
+  const acct = am.accounts[0];
+  acct.quota.tokensLimit = 100;
+  acct.quota.tokensRemaining = 0;
+  acct.quota.requestsLimit = 100;
+  acct.quota.requestsRemaining = 0;    // still exhausted for another hour
+  acct.quota.tokensReset = new Date(now - 1_000).toISOString();      // token reset PASSED
+  acct.quota.requestsReset = new Date(now + 3600_000).toISOString(); // requests free in 1h
+  acct.quota.resetsAt = acct.quota.tokensReset; // collapsed value points at the passed reset
+  const proxy = startProxy(am, 0);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429, 'account must remain blocked by the request window');
+    const ra = parseInt(res.headers.get('retry-after'), 10);
+    assert.ok(ra > 3000 && ra <= 3600, `should wait for the 1h request reset, got ${ra}s`);
+    // The sweep cleared only the token window; the request window survived.
+    assert.equal(acct.quota.tokensLimit, null);
+    assert.equal(acct.quota.requestsLimit, 100);
+  } finally {
+    proxy.close();
+  }
+});

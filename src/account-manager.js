@@ -731,15 +731,31 @@ export class AccountManager {
       }
     }
 
-    // Clear expired standard quotas
-    if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
+    // Clear expired standard quotas — each window INDEPENDENTLY. The token and
+    // request windows reset at different times; sweeping both on the collapsed
+    // resetsAt (token-first) made a still-blocked request window vanish the
+    // moment the sooner token window reset, freeing the account ~an hour early.
+    // A window without its own reset falls back to resetsAt (old snapshots /
+    // upstreams that only send one reset header) — same sweep as before.
+    const tokensResetAt = q.tokensReset || q.resetsAt;
+    if (tokensResetAt && now >= new Date(tokensResetAt).getTime()) {
       q.tokensRemaining = null;
       q.tokensLimit = null;
+      q.tokensReset = null;
+    }
+    const requestsResetAt = q.requestsReset || q.resetsAt;
+    if (requestsResetAt && now >= new Date(requestsResetAt).getTime()) {
       q.requestsRemaining = null;
       q.requestsLimit = null;
-      q.resetsAt = null;
-      q.tokensReset = null;
       q.requestsReset = null;
+    }
+    // Advance the collapsed resetsAt (session-ordering fallback) to the soonest
+    // still-future window reset, or clear it once no window remains.
+    if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
+      const future = [q.tokensReset, q.requestsReset]
+        .map(r => (r ? new Date(r).getTime() : null))
+        .filter(t => t && t > now);
+      q.resetsAt = future.length ? new Date(Math.min(...future)).toISOString() : null;
     }
 
     // Unified quotas (Claude Max) — utilization is already 0-1
