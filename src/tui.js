@@ -114,11 +114,12 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, onQuit }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
+    this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
     this.onQuit = onQuit;
 
     this.log = [];           // completed activity entries
@@ -362,6 +363,21 @@ export class TUI {
       }
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
+    }
+    // Reload also re-measures the WHOLE fleet's quota, not just the account
+    // list: the displayed usage drifts silently (spend from other devices or
+    // sessions never flows through this proxy), so R doubles as a "give me
+    // fresh numbers now" action. Runs after the config sync so probes use any
+    // just-refreshed credentials.
+    if (this.refreshQuota) {
+      try {
+        this._addLog('Re-measuring quota for all accounts...');
+        const n = await this.refreshQuota();
+        if (n >= 0) this._addLog(`Quota re-measured for ${n} account(s)`);
+        else this._addLog('Quota refresh skipped — no request has flowed through the proxy yet');
+      } catch (e) {
+        this._addLog(`Quota refresh failed: ${e.message}`);
+      }
     }
   }
 

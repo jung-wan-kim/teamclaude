@@ -227,6 +227,79 @@ test('utilization-only headers (no resets) do not count as fully measured', () =
   assert.deepEqual(am.warmupCandidates().map(a => a.name), ['a0'], 'still a re-probe candidate');
 });
 
+// Forced fleet re-measure (TUI Reload): probes MEASURED accounts too, pulling
+// fresh upstream numbers on demand — the plain warm-up only ever probes
+// unmeasured accounts, so without this the dashboard drifts until a window
+// rolls over or organic traffic reaches each account.
+test('refreshQuotaAll re-probes already-measured accounts with fresh values', async () => {
+  let util = '0.10';
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': util,
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+      'anthropic-ratelimit-unified-7d-utilization': util,
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const proxyPort = await listen(proxy);
+  try {
+    // First real request commits the template; the fan-out measures the fleet at 0.10.
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(await waitFor(() => am.accounts.every(a => a.quota.unified5h === 0.1)), true,
+      'fleet measured at the initial utilization');
+
+    // Upstream usage moves (e.g. spend from another device) — the plain warm-up
+    // will NOT re-probe (everyone is fully measured), so values stay stale...
+    util = '0.55';
+    const probed = await proxy.refreshQuotaAll();
+    // ...until the forced re-measure pulls the fresh numbers for every account.
+    assert.equal(probed, 3, 'every enabled idle account was probed');
+    assert.equal(am.accounts.every(a => a.quota.unified5h === 0.55), true,
+      'measured accounts re-measured with the fresh utilization');
+
+    // An account with a request in flight is skipped — that response will
+    // refresh it anyway, and a probe would just race it.
+    util = '0.80';
+    am.accounts[1].inflight = 1;
+    try {
+      assert.equal(await proxy.refreshQuotaAll(), 2, 'busy account excluded from the fan-out');
+      assert.equal(am.accounts[1].quota.unified5h, 0.55, 'busy account left untouched');
+      assert.equal(am.accounts[0].quota.unified5h, 0.8, 'idle accounts still refreshed');
+    } finally {
+      am.accounts[1].inflight = 0;
+    }
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => upstream.close(r));
+  }
+});
+
+test('refreshQuotaAll without a committed template reports -1 and sends nothing', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  await listen(proxy);
+  try {
+    assert.equal(await proxy.refreshQuotaAll(), -1, 'no template → honest -1, no guessing a shape');
+    assert.equal(seen.length, 0, 'no probe was sent upstream');
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => upstream.close(r));
+  }
+});
+
 // Regression (review findings): warm-up budget recovery paths.
 test('a rollover sweep renews BOTH warm-up budgets (_partialProbes and _warmupTries)', () => {
   const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);

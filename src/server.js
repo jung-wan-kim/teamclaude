@@ -138,12 +138,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   //    capacity 429 could not.
   //  - Learns ONLY from a response upstream accepted (2xx) or an account-level
   //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
-  async function warmupAccount(account) {
+  async function warmupAccount(account, { force = false } = {}) {
     if (!probeTemplate || warmupClosed || account._warming) return;
     // Don't refresh from a background probe; skip an OAuth account that needs one.
     if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
-    // Re-confirm it's still an available, unmeasured, idle candidate.
-    if (!accountManager.warmupCandidates().includes(account)) return;
+    // Re-confirm it's still an available, unmeasured, idle candidate — unless
+    // this is a FORCED re-measure (TUI Reload), which deliberately probes
+    // already-measured (and even throttled/near-quota) accounts to pull fresh
+    // upstream numbers. The idle/enabled screening for that path lives in
+    // refreshQuotaAll.
+    if (!force && !accountManager.warmupCandidates().includes(account)) return;
     account._warming = true;
     const probe = probeSignal();
     try {
@@ -203,6 +207,27 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       probe.cleanup(); // clear the timeout + warmupAbort listener now (not 15s later)
       account._warming = false;
     }
+  }
+
+  // Forced fleet re-measure (TUI Reload / R): probe EVERY enabled idle account,
+  // measured or not, so the dashboard reflects fresh upstream numbers on demand
+  // — usage spent from other devices/sessions never flows through this proxy,
+  // so the displayed values can silently drift until the next organic
+  // measurement. Throttled/near-quota accounts are included on purpose (their
+  // exhausted-429 responses still carry authoritative quota headers); accounts
+  // with a request in flight are skipped (that response refreshes them), as
+  // are disabled and auth-error accounts. The convergence budgets are renewed
+  // first — an explicit user action is a fresh reason to probe. Returns the
+  // number of accounts probed, or -1 when no probe template exists yet
+  // (nothing has flowed through the proxy, so there is no known-accepted
+  // request shape to replay).
+  async function refreshQuotaAll() {
+    if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
+    const targets = accountManager.accounts.filter(a =>
+      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming);
+    for (const a of targets) a._partialProbes = 0;
+    await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
+    return targets.length;
   }
 
   // Probe every currently-unmeasured idle account in parallel. Guarded so two
@@ -382,6 +407,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const closeServer = server.close.bind(server);
   server.close = (cb) => { shutdownWarmup(); return closeServer(cb); };
   server.on('close', shutdownWarmup);
+
+  // Exposed for the TUI Reload path (and tests): forced fleet-wide quota
+  // re-measure. Kept off the HTTP surface — it spends real upstream requests,
+  // so only a deliberate local action should trigger it.
+  server.refreshQuotaAll = refreshQuotaAll;
 
   return server;
 }

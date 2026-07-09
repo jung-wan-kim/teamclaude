@@ -332,6 +332,30 @@ test('an unmeasured Fable window renders an empty Fbl bar; API-key rows pad the 
   assert.equal(oauthRow.length, apiRow.length, 'slot padded so columns stay aligned');
 });
 
+// ── Reload (R) re-measures quota, not just accounts ──────────────────────────
+
+test('R (sync) also triggers the fleet quota re-measure and logs the count', async () => {
+  const { tui } = makeTUI(['a0']);
+  let called = 0;
+  tui.refreshQuota = async () => { called++; return 1; };
+  await tui._doSync();
+  assert.equal(called, 1, 'refreshQuota invoked by the reload path');
+  assert.equal(tui.log.some(l => /Quota re-measured for 1 account/.test(l.msg)), true,
+    'result surfaced in the activity log');
+});
+
+test('R without traffic yet logs an honest skip; no refreshQuota wiring stays harmless', async () => {
+  const { tui } = makeTUI(['a0']);
+  tui.refreshQuota = async () => -1;                    // server has no probe template
+  await tui._doSync();
+  assert.equal(tui.log.some(l => /no request has flowed/.test(l.msg)), true,
+    'skip reason surfaced instead of a silent no-op');
+
+  const bare = makeTUI(['a0']).tui;                     // no refreshQuota (legacy wiring)
+  await bare._doSync();                                  // must not throw
+  assert.equal(bare.log.some(l => /Config reloaded/.test(l.msg)), true);
+});
+
 // ── enable/disable (unchanged) ──────────────────────────────────────────────
 
 test('TUI "e" toggle disables/enables the selected account and persists it', async () => {

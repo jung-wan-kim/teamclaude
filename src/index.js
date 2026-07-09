@@ -223,6 +223,10 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
+      // R also forces a fleet-wide quota re-measure. `server` is assigned below
+      // (before listen), and the TUI only starts inside the listen callback, so
+      // this closure never runs before the binding is initialized.
+      refreshQuota: () => server.refreshQuotaAll(),
       onQuit: () => { server.close(() => process.exit(0)); },
     });
     hooks = {
