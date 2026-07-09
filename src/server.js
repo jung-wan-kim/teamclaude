@@ -186,6 +186,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           account._lastFruitlessProbeAt = Date.now(); // paces the slow retry backstop
         }
         console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
+        return true; // quota actually folded — the forced-refresh path counts these
       } else if (accountManager.accounts[account.index] === account
           && (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429))) {
         // The probe COMPLETED with a DETERMINISTIC fruitless outcome — a 2xx
@@ -207,6 +208,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       probe.cleanup(); // clear the timeout + warmupAbort listener now (not 15s later)
       account._warming = false;
     }
+    return false; // skipped, fruitless, or failed — nothing was measured
   }
 
   // Forced fleet re-measure (TUI Reload / R): probe EVERY enabled idle account,
@@ -225,9 +227,22 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
     const targets = accountManager.accounts.filter(a =>
       a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming);
-    for (const a of targets) a._partialProbes = 0;
-    await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
-    return targets.length;
+    // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
+    // background failure could mark an account 'error' before any real request
+    // proved auth), so an account that has sat idle past its token lifetime
+    // gets silently skipped by warmupAccount's expiring-token guard — the
+    // no.1 reason a fleet-wide refresh would quietly update almost nothing.
+    // An explicit user action (R) is the right moment to pay that refresh:
+    // failures are the same actionable truth the client path would surface.
+    await Promise.all(targets.map(a =>
+      accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status/error below */ })));
+    const alive = targets.filter(a => a.status !== 'error');
+    for (const a of alive) a._partialProbes = 0;
+    const outcomes = await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
+    // Honest accounting: `targets` is what the user asked to refresh, `measured`
+    // is what actually got fresh data — the TUI reports M/N, never a blanket
+    // "refreshed N" while probes silently skipped or failed.
+    return { targets: targets.length, measured: outcomes.filter(Boolean).length };
   }
 
   // Probe every currently-unmeasured idle account in parallel. Guarded so two

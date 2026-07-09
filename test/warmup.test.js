@@ -261,9 +261,9 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
     // Upstream usage moves (e.g. spend from another device) — the plain warm-up
     // will NOT re-probe (everyone is fully measured), so values stay stale...
     util = '0.55';
-    const probed = await proxy.refreshQuotaAll();
+    const r1 = await proxy.refreshQuotaAll();
     // ...until the forced re-measure pulls the fresh numbers for every account.
-    assert.equal(probed, 3, 'every enabled idle account was probed');
+    assert.deepEqual(r1, { targets: 3, measured: 3 }, 'every enabled idle account probed AND measured');
     assert.equal(am.accounts.every(a => a.quota.unified5h === 0.55), true,
       'measured accounts re-measured with the fresh utilization');
 
@@ -272,7 +272,8 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
     util = '0.80';
     am.accounts[1].inflight = 1;
     try {
-      assert.equal(await proxy.refreshQuotaAll(), 2, 'busy account excluded from the fan-out');
+      assert.deepEqual(await proxy.refreshQuotaAll(), { targets: 2, measured: 2 },
+        'busy account excluded from the fan-out');
       assert.equal(am.accounts[1].quota.unified5h, 0.55, 'busy account left untouched');
       assert.equal(am.accounts[0].quota.unified5h, 0.8, 'idle accounts still refreshed');
     } finally {
@@ -281,6 +282,52 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
   } finally {
     await new Promise(r => proxy.close(r));
     await new Promise(r => upstream.close(r));
+  }
+});
+
+// Root cause of "R updates nothing" in production: idle accounts sit past
+// their token lifetime, and warmupAccount's expiring-token guard silently
+// skips them. The FORCED refresh must revive tokens first (an explicit user
+// action pays that refresh), and the returned counts must be honest when a
+// token cannot be revived.
+test('refreshQuotaAll refreshes lapsed tokens first and reports honest counts', async () => {
+  const authsSeen = [];
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    if (raw.includes('"max_tokens":1')) authsSeen.push(req.headers['authorization']);
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 3);
+  am.accounts[1].expiresAt = Date.now() - 3600_000;   // lapsed — old guard silently skipped it
+  am.accounts[2].expiresAt = Date.now() - 3600_000;   // lapsed AND unrefreshable
+  const refreshed = [];
+  am.ensureTokenFresh = async (ref) => {              // stand-in for the real OAuth refresh
+    const a = am._resolve(ref);
+    refreshed.push(a.name);
+    if (a.name === 'a2') { a.status = 'error'; throw new Error('refresh_token revoked'); }
+    if (Date.now() >= (a.expiresAt || 0)) { a.credential = `tok-fresh-${a.name}`; a.expiresAt = Date.now() + 3600_000; }
+  };
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const proxyPort = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const r = await proxy.refreshQuotaAll();
+    assert.equal(refreshed.length >= 3, true, 'token refresh attempted for every target');
+    assert.equal(authsSeen.some(h => h === 'Bearer tok-fresh-a1'), true,
+      'lapsed-token account was probed WITH its freshly refreshed token');
+    assert.equal(r.targets, 3, 'the user asked to refresh 3 accounts');
+    assert.equal(r.measured, 2, 'the unrefreshable account is not counted as measured');
+    assert.equal(am.accounts[1].quota.unified5h, 0.1, 'revived account got fresh quota');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
   }
 });
 

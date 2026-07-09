@@ -337,11 +337,19 @@ test('an unmeasured Fable window renders an empty Fbl bar; API-key rows pad the 
 test('R (sync) also triggers the fleet quota re-measure and logs the count', async () => {
   const { tui } = makeTUI(['a0']);
   let called = 0;
-  tui.refreshQuota = async () => { called++; return 1; };
+  tui.refreshQuota = async () => { called++; return { targets: 1, measured: 1 }; };
   await tui._doSync();
   assert.equal(called, 1, 'refreshQuota invoked by the reload path');
-  assert.equal(tui.log.some(l => /Quota re-measured for 1 account/.test(l.msg)), true,
+  assert.equal(tui.log.some(l => /Quota re-measured for all 1 account/.test(l.msg)), true,
     'result surfaced in the activity log');
+});
+
+test('a partial refresh is reported honestly as M/N, not a blanket success', async () => {
+  const { tui } = makeTUI(['a0']);
+  tui.refreshQuota = async () => ({ targets: 11, measured: 3 });
+  await tui._doSync();
+  assert.equal(tui.log.some(l => /Quota re-measured for 3\/11 account/.test(l.msg)), true,
+    'partial result surfaced with the failed/skipped remainder called out');
 });
 
 test('R without traffic yet logs an honest skip; no refreshQuota wiring stays harmless', async () => {

@@ -372,9 +372,17 @@ export class TUI {
     if (this.refreshQuota) {
       try {
         this._addLog('Re-measuring quota for all accounts...');
-        const n = await this.refreshQuota();
-        if (n >= 0) this._addLog(`Quota re-measured for ${n} account(s)`);
-        else this._addLog('Quota refresh skipped — no request has flowed through the proxy yet');
+        const r = await this.refreshQuota();
+        if (r === -1 || r == null) {
+          this._addLog('Quota refresh skipped — no request has flowed through the proxy yet');
+        } else if (r.measured === r.targets) {
+          this._addLog(`Quota re-measured for all ${r.measured} account(s)`);
+        } else {
+          // Honest partial result — some probes were skipped (expired token
+          // that would not refresh, auth error) or failed. Never report a
+          // blanket success while accounts silently kept stale numbers.
+          this._addLog(`Quota re-measured for ${r.measured}/${r.targets} account(s) — the rest failed or were skipped`);
+        }
       } catch (e) {
         this._addLog(`Quota refresh failed: ${e.message}`);
       }
