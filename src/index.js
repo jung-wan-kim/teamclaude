@@ -145,6 +145,12 @@ async function serverCommand() {
     savedAt: new Date().toISOString(),
     currentAccount: accountManager.accounts[accountManager.currentIndex]?.name || null,
     accounts: accountManager.exportQuotaState(),
+    // The committed warm-up probe template — persisting it lets forced
+    // re-measure (TUI R) and warm-up probes work immediately after a restart,
+    // before any traffic re-seeds a known-accepted request shape. (`server` is
+    // initialized before this ever runs: the snapshot writers are registered
+    // inside the listen callback.)
+    probeTemplate: server.exportProbeTemplate?.() ?? null,
   });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
@@ -248,6 +254,13 @@ async function serverCommand() {
   }
 
   const server = createProxyServer(accountManager, config, hooks);
+  // Restore the last run's committed probe template alongside the quota
+  // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
+  // freshly restarted idle proxy — without this the template is memory-only
+  // and R reports "no request has flowed" until real traffic re-seeds it.
+  if (quotaCache?.probeTemplate && server.importProbeTemplate?.(quotaCache.probeTemplate)) {
+    console.log('[TeamClaude] Restored warm-up probe template');
+  }
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.

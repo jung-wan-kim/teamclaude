@@ -94,7 +94,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   function commitProbeTemplate(candidate, status, elicitsModelWeekly = false) {
     if (!activeWarmup || warmupClosed) return;
     if (!(status >= 200 && status < 300)) return; // only trust an accepted shape
-    if (probeTemplate && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
+    // A template RESTORED from the last run's snapshot is provisional: it let
+    // probes work before any traffic, but upstream accepted it in a previous
+    // process — the model may have been retired since. The first freshly
+    // accepted shape therefore always replaces it (fresh evidence wins; the
+    // Fable-window upgrade then re-applies organically among fresh commits).
+    if (probeTemplate && !probeTemplate._restored
+        && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
     probeTemplate = { ...candidate, _elicitsModelWeekly: elicitsModelWeekly };
     setImmediate(() => { warmupUnmeasured(); });
   }
@@ -379,7 +385,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // response also tells us whether this request's model tier reports
             // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
             // limit) — the one property worth a one-way template upgrade.
-            if (!probeTemplate || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
+            if (!probeTemplate || probeTemplate._restored
+                || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
               const candidate = stageProbeTemplate(req, body);
               if (candidate) commitProbeTemplate(candidate, ctx.status, ctx.sawModelWeekly === true);
             }
@@ -438,6 +445,29 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // re-measure. Kept off the HTTP surface — it spends real upstream requests,
   // so only a deliberate local action should trigger it.
   server.refreshQuotaAll = refreshQuotaAll;
+
+  // Probe-template persistence (wired into the quota snapshot by index.js).
+  // The template is the only known-accepted request shape — without persisting
+  // it, a freshly restarted idle proxy can't probe at all: quota restores from
+  // the snapshot (accounts read "measured"), no traffic flows, so forced
+  // re-measure (TUI R) returns -1 until the first genuine request. Restoring
+  // the last run's template closes that gap; it is marked `_restored` so the
+  // first freshly accepted shape replaces it (see commitProbeTemplate).
+  server.exportProbeTemplate = () => (probeTemplate ? { ...probeTemplate } : null);
+  server.importProbeTemplate = (t) => {
+    // Never clobber live evidence: a committed-in-this-process template wins.
+    if (!activeWarmup || warmupClosed || probeTemplate) return false;
+    if (!t || typeof t !== 'object' || typeof t.model !== 'string' || !t.model) return false;
+    probeTemplate = {
+      model: t.model,
+      version: typeof t.version === 'string' && t.version ? t.version : '2023-06-01',
+      beta: typeof t.beta === 'string' && t.beta ? t.beta : null,
+      system: t.system ?? null,
+      _elicitsModelWeekly: t._elicitsModelWeekly === true,
+      _restored: true,
+    };
+    return true;
+  };
 
   return server;
 }
