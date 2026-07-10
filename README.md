@@ -113,7 +113,7 @@ If the configured port is already in use — for example another TeamClaude prox
 | `o` | Order the selected account: `↑`/`↓` move its rank, `a` resets the WHOLE order to `auto` (weekly-reset ordering), `c` clears just this account's rank |
 | `a` | Add account (import or API key) |
 | `d` | Delete an account (with confirmation) |
-| `R` | Reload accounts from config **and re-measure every account's quota** (fresh usage numbers on demand) |
+| `R` | Reload accounts from config **and re-measure every account's quota** — revives lapsed OAuth tokens first, includes the model-scoped Fable window, and reports an honest `M/N` when some accounts fail or are skipped |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
