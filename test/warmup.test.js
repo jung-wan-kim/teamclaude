@@ -285,6 +285,60 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
   }
 });
 
+// The Fable (7d_oi) weekly window only appears on responses to requests for
+// that model tier, so a template captured from e.g. a background haiku request
+// can never refresh the Fbl numbers — the user-visible symptom is "everything
+// refreshes except the Fable limit". The template must upgrade — one way — to
+// a shape whose own response carried a model-scoped weekly window.
+test('the probe template upgrades to the model tier that reports the Fable window', async () => {
+  const probeModels = [];
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    const json = JSON.parse(raw);
+    if (raw.includes('"max_tokens":1')) probeModels.push(json.model);
+    const headers = RL_HEADERS();
+    if (json.model === 'claude-top-tier') {          // only this tier reports the extra window
+      headers['anthropic-ratelimit-unified-7d_oi-utilization'] = '0.42';
+      headers['anthropic-ratelimit-unified-7d_oi-reset'] = String(Math.floor((Date.now() + 24 * HOUR) / 1000));
+    }
+    res.writeHead(200, headers);
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const proxyPort = await listen(proxy);
+  const send = model => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  try {
+    await send('claude-small-tier');                 // first traffic → small-tier template commits
+    await waitFor(() => am.accounts.every(a => a.quota.unified5h != null));
+    let r = await proxy.refreshQuotaAll();
+    assert.equal(r.measured, 2);
+    assert.equal(am.accounts.every(a => !('7d_oi' in a.quota.modelWeekly)), true,
+      'small-tier probes cannot see the Fable window');
+
+    await send('claude-top-tier');                   // a top-tier request flows → one-way upgrade
+    r = await proxy.refreshQuotaAll();
+    assert.equal(r.measured, 2);
+    assert.equal(probeModels.slice(-2).every(m => m === 'claude-top-tier'), true,
+      'probes now replay the upgraded (window-eliciting) shape');
+    assert.equal(am.accounts.every(a => a.quota.modelWeekly['7d_oi']?.utilization === 0.42), true,
+      'forced refresh now updates the Fable window fleet-wide');
+
+    await send('claude-small-tier');                 // later small-tier traffic must NOT downgrade
+    await proxy.refreshQuotaAll();
+    assert.equal(probeModels[probeModels.length - 1], 'claude-top-tier', 'template did not downgrade');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
 // Root cause of "R updates nothing" in production: idle accounts sit past
 // their token lifetime, and warmupAccount's expiring-token guard silently
 // skips them. The FORCED refresh must revive tokens first (an explicit user

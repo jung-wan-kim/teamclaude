@@ -65,9 +65,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Stage a candidate template from a genuine /v1/messages request WITHOUT
   // committing — we only trust the shape once upstream has accepted it (see
   // commitProbeTemplate). Path-exact so /v1/messages/count_tokens isn't taken for
-  // inference. Returns the candidate (or null).
+  // inference. Returns the candidate (or null). Called AFTER the response (the
+  // caller decides whether a commit/upgrade is even possible), so the body
+  // parse is only ever paid for the one or two requests that actually commit.
   function stageProbeTemplate(req, body) {
-    if (!activeWarmup || probeTemplate) return null;
+    if (!activeWarmup) return null;
     if (req.method !== 'POST' || req.url.split('?')[0] !== '/v1/messages') return null;
     let json;
     try { json = JSON.parse(body.toString()); } catch { return null; }
@@ -80,12 +82,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     };
   }
 
-  // Commit a staged template once its request succeeded (2xx), then fan out so the
-  // rest of the fleet is measured within seconds of the first post-restart request.
-  function commitProbeTemplate(candidate, status) {
-    if (!activeWarmup || probeTemplate || warmupClosed) return;
+  // Commit a staged template once its request succeeded (2xx), then fan out so
+  // the rest of the fleet is measured within seconds of the first post-restart
+  // request. The MODEL matters beyond acceptance: model-scoped weekly windows
+  // (7d_oi — the "Fable" weekly limit) only appear on responses to requests for
+  // that model tier, so probes replaying e.g. a haiku-shaped template can never
+  // refresh the Fbl numbers. Therefore exactly one one-way UPGRADE is allowed:
+  // a shape whose own response carried a 7d_* window (elicitsModelWeekly)
+  // replaces a committed shape that didn't. No model names are hardcoded — the
+  // template converges to whatever tier actually reports the extra window.
+  function commitProbeTemplate(candidate, status, elicitsModelWeekly = false) {
+    if (!activeWarmup || warmupClosed) return;
     if (!(status >= 200 && status < 300)) return; // only trust an accepted shape
-    probeTemplate = candidate;
+    if (probeTemplate && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
+    probeTemplate = { ...candidate, _elicitsModelWeekly: elicitsModelWeekly };
     setImmediate(() => { warmupUnmeasured(); });
   }
 
@@ -330,7 +340,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null };
+        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -354,11 +364,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           }
           const body = Buffer.concat(bodyChunks);
 
-          // Stage a warm-up template from this request (no-op once committed / when
-          // warm-up is off). It's COMMITTED only after forwardRequest returns a 2xx
-          // below, so a request upstream rejects can't seed a bad template.
-          const stagedTemplate = stageProbeTemplate(req, body);
-
           // Tie an abort signal to client disconnect so a request that's only
           // WAITING in the overflow queue is cancelled if the client goes away —
           // otherwise it would acquire a slot later and be dispatched upstream,
@@ -369,9 +374,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           ctx.abortSignal = ac.signal;
           try {
             await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
-            // Commit the warm-up template only after upstream accepted this request
-            // (2xx via ctx.status), then fan out to measure the rest of the fleet.
-            if (stagedTemplate) commitProbeTemplate(stagedTemplate, ctx.status);
+            // Stage + commit the warm-up template AFTER the response: only an
+            // upstream-accepted shape (2xx via ctx.status) is trusted, and the
+            // response also tells us whether this request's model tier reports
+            // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
+            // limit) — the one property worth a one-way template upgrade.
+            if (!probeTemplate || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
+              const candidate = stageProbeTemplate(req, body);
+              if (candidate) commitProbeTemplate(candidate, ctx.status, ctx.sawModelWeekly === true);
+            }
           } finally {
             res.removeListener('close', onClose);
           }
@@ -741,6 +752,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (key.startsWith('anthropic-ratelimit-')) {
         rateLimitHeaders[key] = value;
       }
+    }
+    // Did this request's model tier report a model-scoped weekly window
+    // (anthropic-ratelimit-unified-7d_<label>-*)? Only such requests can teach
+    // probes to refresh the Fable weekly numbers — used by the template-upgrade
+    // decision in the request handler. Request-scoped: any attempt's headers
+    // prove the property, since the request shape is identical across failovers.
+    if (Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-7d_'))) {
+      ctx.sawModelWeekly = true;
     }
     accountManager.updateQuota(account, rateLimitHeaders);
 
