@@ -42,6 +42,11 @@ teamclaude server
 teamclaude run
 ```
 
+> **Important:** a running proxy does not automatically capture a plain `claude`
+> process. Start Claude Code with `teamclaude run`; otherwise it connects directly
+> with its single logged-in account and cannot rotate when that account reaches a
+> usage limit.
+
 You can also import existing Claude Code credentials instead of logging in:
 
 ```bash
@@ -147,6 +152,22 @@ CLI changes made while the server is running are picked up with **R** (reload) i
 
 ```bash
 teamclaude run
+```
+
+`teamclaude run` injects the proxy URL into the Claude Code child process. The
+environment is fixed when that process starts, so starting or restarting the
+TeamClaude server later does **not** reroute an already-open direct session. A
+direct session can therefore show an account-specific message such as "out of
+usage credits" even while the TeamClaude TUI is healthy and other accounts have
+quota remaining.
+
+If this happens, exit the direct session and resume it through TeamClaude from
+the same working directory:
+
+```bash
+teamclaude run -- --continue
+# Or resume a specific conversation:
+teamclaude run -- --resume <session-id>
 ```
 
 Or manually set the environment:
