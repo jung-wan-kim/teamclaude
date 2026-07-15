@@ -16,7 +16,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Active warm-up** — after a (re)start the proxy probes still-unmeasured accounts with a minimal request (reusing the shape of the first real request, restored across restarts), so the whole fleet's quota populates within seconds instead of waiting for traffic to reach each account
 - **Server lifecycle** — `teamclaude stop` / `teamclaude restart` cleanly stop or replace the running server from any terminal
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also force-re-measures the whole fleet's quota, so the dashboard reflects usage spent outside this proxy (other devices/sessions) — and works right after a restart, since the probe template is restored from the snapshot
+- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also best-effort re-measures eligible idle accounts, so response-derived dashboard values catch up with usage spent outside this proxy (other devices/sessions) — and works right after a restart, since the probe template is restored from the snapshot
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
@@ -118,7 +118,7 @@ If the configured port is already in use — for example another TeamClaude prox
 | `o` | Order the selected account: `↑`/`↓` move its rank, `a` resets the WHOLE order to `auto` (weekly-reset ordering), `c` clears just this account's rank |
 | `a` | Add account (import or API key) |
 | `d` | Delete an account (with confirmation) |
-| `R` | Reload accounts from config **and re-measure every account's quota** — revives lapsed OAuth tokens first, includes the model-scoped Fable window, and reports an honest `M/N` when some accounts fail or are skipped |
+| `R` | Reload accounts from config and best-effort re-measure eligible idle accounts — skips disabled, busy, and auth-error accounts and reports an honest `M/N`; `Fbl` refreshes only when the captured probe template returns a model-scoped weekly header |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -183,7 +183,10 @@ claude
 proxy. They update as requests or warm-up probes pass through an account, but
 they are not an on-demand query of Anthropic's account usage and can lag usage
 spent in another Claude Code session or on another device. Pressing **R**
-re-probes the fleet and refreshes those response-derived values.
+best-effort re-probes eligible idle accounts and refreshes only the headers
+returned by the captured probe template. Disabled, busy, and auth-error accounts
+are skipped; `Fbl` can remain stale until a real request captures a model shape
+that returns the model-scoped weekly header.
 
 Current Claude Code OAuth builds also use `GET /api/oauth/usage` for their own
 usage UI. This is an OAuth-only implementation surface rather than a documented
@@ -195,15 +198,17 @@ last observation.
 Model access is constrained by every applicable window. A `Fbl` bar below 100%
 does not by itself mean Fable can run: the general 5-hour or 7-day window may
 already be at `switchThreshold`. For example, an account showing 59% Fable
-usage but 99% 5-hour usage is unavailable until the 5-hour window resets. Check
-all three windows before diagnosing a model-specific failure.
+usage but 99% 5-hour usage is unavailable with the default 98% threshold until
+the 5-hour window resets. Check all three windows before diagnosing a
+model-specific failure.
 
 > **Custom-fork warning:** this repository deliberately keeps model-scoped
-> weekly values display-only. Do not restore or pre-block an account from a
-> cached `modelWeekly` value; doing so can prevent the account from making the
-> request needed to refresh that same value. If an installation carries a
-> local routing patch, validate or reapply it in the service startup path
-> because an npm or Node upgrade can replace globally installed source files.
+> weekly values display-only. Restoring cached `modelWeekly` values for display
+> is safe, but never derive account availability from them or pre-block routing
+> on startup; doing so can prevent the account from making the request needed
+> to refresh that same value. If an installation carries a local routing patch,
+> validate or reapply it in the service startup path because an npm or Node
+> upgrade can replace globally installed source files.
 
 ### Other commands
 
