@@ -177,12 +177,40 @@ eval $(teamclaude env)
 claude
 ```
 
+### Understand the quota numbers
+
+`teamclaude status` and the TUI show the latest quota headers observed by the
+proxy. They update as requests or warm-up probes pass through an account, but
+they are not an on-demand query of Anthropic's account usage and can lag usage
+spent in another Claude Code session or on another device. Pressing **R**
+re-probes the fleet and refreshes those response-derived values.
+
+Current Claude Code OAuth builds also use `GET /api/oauth/usage` for their own
+usage UI. This is an OAuth-only implementation surface rather than a documented
+general Anthropic API, so TeamClaude does not depend on it for routing. When a
+dashboard value and Claude Code's account usage disagree, treat the OAuth usage
+view as the account-level live check and the TeamClaude value as the proxy's
+last observation.
+
+Model access is constrained by every applicable window. A `Fbl` bar below 100%
+does not by itself mean Fable can run: the general 5-hour or 7-day window may
+already be at `switchThreshold`. For example, an account showing 59% Fable
+usage but 99% 5-hour usage is unavailable until the 5-hour window resets. Check
+all three windows before diagnosing a model-specific failure.
+
+> **Custom-fork warning:** this repository deliberately keeps model-scoped
+> weekly values display-only. Do not restore or pre-block an account from a
+> cached `modelWeekly` value; doing so can prevent the account from making the
+> request needed to refresh that same value. If an installation carries a
+> local routing patch, validate or reapply it in the service startup path
+> because an npm or Node upgrade can replace globally installed source files.
+
 ### Other commands
 
 ```bash
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
-teamclaude status            # Show live proxy status (requires running server)
+teamclaude status            # Show the proxy's last-observed quota status (requires running server)
 teamclaude stop              # Stop the running proxy server
 teamclaude restart           # Stop the running server and start a fresh one
 teamclaude remove <name>     # Remove an account
@@ -253,7 +281,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization. Model-scoped weekly windows (`7d_oi` — the separate "Fable" weekly limit) are tracked and displayed too, but never affect routing: an account over its Fable weekly limit still serves every other model
+4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track the proxy's last-observed session (5h) and weekly (7d) quota utilization. Model-scoped weekly windows (`7d_oi` — the separate "Fable" weekly limit) are tracked and displayed too, but never affect routing: an account over its Fable weekly limit still serves every other model. These response-derived values are refreshed by traffic or warm-up probes; TeamClaude does not call Claude Code's OAuth-only `/api/oauth/usage` surface
 5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. An **active warm-up** additionally probes unmeasured accounts directly — a minimal 1-token request reusing the shape of the first real request — so the whole fleet is measured within seconds of the first post-restart request instead of waiting for traffic to reach each account (`activeWarmup: false` disables it). Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose weekly (7d) quota resets soonest (tie-breaks: soonest session reset, then lowest usage), so quota about to renew unused is drained first. Explicitly ranked accounts (`priority` / TUI `o`) are preferred before all of that; disabled accounts are excluded entirely. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min; set `0` to disable timer-based switching), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On a 429 the proxy classifies it (never sleeping holding the client connection):
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
