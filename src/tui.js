@@ -667,11 +667,14 @@ export class TUI {
       // two (Ses / Wk) on mid widths, one on narrow ones.
       const showThree = W >= 92;
       const showBoth = W >= 70;
+      // The +4 in each offset reserves the width of the leading row-number
+      // column (" NN." + its separator), so adding it doesn't push the bars
+      // past the terminal edge and clip the rightmost (Fbl) bar.
       const bw = showThree
-        ? Math.max(5, Math.min(20, Math.floor((W - 62) / 3)))
+        ? Math.max(5, Math.min(20, Math.floor((W - 66) / 3)))
         : showBoth
-          ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-          : Math.max(5, Math.min(20, W - 45));
+          ? Math.max(5, Math.min(20, Math.floor((W - 60) / 2)))
+          : Math.max(5, Math.min(20, W - 49));
 
       // Sync the cursor position to the anchored account before drawing — the
       // display order may have changed since the last frame (quota updates
@@ -735,6 +738,11 @@ export class TUI {
     const sel = isMoving ? cyan('⇅') : isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
 
+    // Row number — the account's 1-based position in the displayed order, so
+    // the list is easy to reference at a glance. Right-aligned to 2 cols (fleet
+    // sizes are small; a 3rd digit just widens the gutter for 100+ accounts).
+    const num = gray(String(pos + 1).padStart(2) + '.');
+
     // Name (bold if selected)
     const rawName = a.name.slice(0, 12).padEnd(12);
     const name = isSel ? bold(rawName) : rawName;
@@ -797,7 +805,7 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${num} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
