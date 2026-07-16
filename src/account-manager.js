@@ -591,6 +591,26 @@ export class AccountManager {
   }
 
   /**
+   * A fully-measured OAuth account whose model-scoped weekly window (the Fable
+   * `7d_oi` limit) is still absent. Such a window only appears on responses to
+   * Fable-tier requests, so an account that was measured by lower-tier traffic
+   * or a lower-tier probe keeps its `Fbl` bar blank — and because it IS fully
+   * measured for 5h/7d, ordinary warm-up (which only targets unmeasured
+   * accounts) never re-probes it. This flags it for a bounded model-weekly
+   * top-up probe, run ONLY when the committed probe template can actually
+   * elicit the window (see server.js). The `_mwProbes` cap stops an account
+   * whose upstream genuinely never reports the window from being probed every
+   * interval forever; it resets when the window populates or a quota window is
+   * swept (a fresh week is a fresh reason to look).
+   */
+  needsModelWeekly(account) {
+    return account.type === 'oauth'
+      && this._fullyMeasured(account)
+      && Object.keys(account.quota.modelWeekly).length === 0
+      && (account._mwProbes || 0) < this.maxWarmupTries;
+  }
+
+  /**
    * An account still needing warm-up: available, not yet MEASURED, under the
    * per-account attempt cap.
    *
@@ -723,11 +743,13 @@ export class AccountManager {
       account._warmupTries = 0;
     }
     // Clear expired model-scoped weekly windows (display-only, but a stale
-    // "94% Fable" bar after the window reset would mislead)
+    // "94% Fable" bar after the window reset would mislead). A cleared window is
+    // a fresh reason to top it up again, so renew the model-weekly probe budget.
     for (const [label, win] of Object.entries(q.modelWeekly)) {
       if (win.reset && now >= win.reset) {
         console.log(`[TeamClaude] Account "${account.name}" ${label} quota reset`);
         delete q.modelWeekly[label];
+        account._mwProbes = 0;
       }
     }
 
