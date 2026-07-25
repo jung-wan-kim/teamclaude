@@ -1127,6 +1127,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Same cause-tagging as the 401 path: a non-transient SEND failure is not
       // a refresh failure, so the token sweep must not auto-revive it. Only tag
       // on the transition, preserving an earlier refresh-caused label.
+      // Deliberately NO valid-token demotion here (unlike the 401 path): a send
+      // failure is a transport observation, not deterministic account-level
+      // rejection evidence, so it must not permanently park an account whose
+      // only proven defect was a failed refresh. If the sweep later revives it
+      // and the transport problem persists, the first real request re-parks it
+      // — this time labeled send-caused (the transition above fires from
+      // 'active') — so mislabeling self-corrects in at most one bounded flap,
+      // whereas demoting would trade that for permanent in-run capacity loss.
       if (account.status !== 'error') account._errorFromRefresh = false;
       account.status = 'error';
       releaseHeld(); // this account errored; fail over to another
