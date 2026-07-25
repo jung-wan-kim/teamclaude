@@ -447,7 +447,7 @@ export class TUI {
           amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
-          if (amAcct.status === 'error') amAcct.status = 'active';
+          if (amAcct.status === 'error') { amAcct.status = 'active'; delete amAcct._errorFromRefresh; }
         } else {
           // The matched config entry had no live AccountManager account (it was
           // skipped at load — e.g. previously tokenless). Now that we have fresh

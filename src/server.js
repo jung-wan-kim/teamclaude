@@ -858,6 +858,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // or it's an API-key account — fail this account out and switch.
       if (account.status !== 'error') {
         account.status = 'error';
+        // Upstream rejected the account (401 despite a fresh token) — NOT a
+        // refresh failure. The token sweep must not revive it just because the
+        // token endpoint still rotates; only new credentials or a restart do.
+        account._errorFromRefresh = false;
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
       }
       if (logDir) {
@@ -1113,6 +1117,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
 
     if (retryCount < maxRetries && !res.headersSent) {
+      // Same cause-tagging as the 401 path: a non-transient SEND failure is not
+      // a refresh failure, so the token sweep must not auto-revive it. Only tag
+      // on the transition, preserving an earlier refresh-caused label.
+      if (account.status !== 'error') account._errorFromRefresh = false;
       account.status = 'error';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
