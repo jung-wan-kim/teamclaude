@@ -10,6 +10,7 @@
   "overflowQueueTimeoutMs": 15000,
   "activeWarmup": true,
   "warmupIntervalMs": 300000,
+  "tokenRefreshIntervalMs": 300000,
   "accounts": [
     {
       "name": "primary-max",

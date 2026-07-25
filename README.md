@@ -15,7 +15,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Quota survives restarts** — per-account quota state *and* the warm-up probe template are snapshotted to `<config>.quota.json` (every minute and on exit) and restored at startup, so a restart doesn't blank the dashboard, blind the account ordering, or leave forced re-measure (**R**) dead until traffic flows again
 - **Active warm-up** — after a (re)start the proxy probes still-unmeasured accounts with a minimal request (reusing the shape of the first real request, restored across restarts), so the whole fleet's quota populates within seconds instead of waiting for traffic to reach each account
 - **Server lifecycle** — `teamclaude stop` / `teamclaude restart` cleanly stop or replace the running server from any terminal
-- **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
+- **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched. A periodic keep-alive sweep (default 5 min) also refreshes **idle** accounts' expiring tokens — so a refresh-token chain that would otherwise stop rotating (and eventually be invalidated upstream) stays alive with zero traffic — and force-retries accounts stuck in `error`, returning them to rotation the moment their token heals
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also force-re-measures the whole fleet's quota, so the dashboard reflects usage spent outside this proxy (other devices/sessions) — and works right after a restart, since the probe template is restored from the snapshot
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
@@ -224,6 +224,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `reevalIntervalMs` | How often (ms) to re-rank accounts by priority while the active one is healthy (optional, default `300000` = 5 min). Set to `0` to disable the timer entirely — the active account then only changes when it becomes unavailable or via per-request 429 failover |
 | `activeWarmup` | Probe unmeasured accounts after a restart to populate quota (optional, default `true`) |
 | `warmupIntervalMs` | How often (ms) the active warm-up re-probes accounts whose quota window reset (optional, default `300000` = 5 min; `0` = startup-only) |
+| `tokenRefreshIntervalMs` | How often (ms) the token keep-alive sweep runs (optional, default `300000` = 5 min; `0` = disable). Each sweep refreshes OAuth tokens that are expiring/expired and force-retries accounts stuck in `error`, so an idle account's refresh-token chain keeps rotating and transient refresh failures self-heal |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
 

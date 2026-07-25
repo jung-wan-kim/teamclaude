@@ -974,6 +974,12 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        // A successful refresh means the account is usable again — clear a prior
+        // 'error' (e.g. a refresh that failed while the network was down) so it
+        // rejoins rotation without a proxy restart. getActiveAccount excludes
+        // 'error', so nothing else would ever revive it; the periodic token
+        // sweep (refreshLapsedTokens) re-tries such accounts.
+        if (account.status === 'error') account.status = 'active';
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         // Only persist if the account is still live at its claimed index. If it was
         // removed during the (awaited) network refresh, its `.index` is stale and
@@ -993,6 +999,37 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * Periodic token keep-alive + recovery sweep (ported from teamclaude-cloud's
+   * recovery timer). Anthropic rotates the refresh token on every refresh, and a
+   * chain that never rotates — an account that sits idle because no client
+   * traffic routes there, while warm-up probes deliberately never refresh
+   * tokens — can eventually be invalidated upstream, permanently killing the
+   * account until a manual re-login. This sweep keeps every account's chain
+   * rotating even with zero traffic:
+   *  - an OAuth account whose access token is expiring (or already expired) is
+   *    refreshed proactively — that's ~once per access-token lifetime, NOT once
+   *    per tick (a fresh token is a no-op inside ensureTokenFresh);
+   *  - an account stuck in 'error' (e.g. a refresh that failed while the
+   *    network was down) is force-retried — a successful refresh clears the
+   *    error and returns it to rotation (see ensureTokenFresh). An account
+   *    whose refresh token is genuinely revoked just stays 'error' (one failed
+   *    attempt per sweep) until re-imported / re-logged-in.
+   * Disabled accounts are swept too: disable means "out of rotation", not "let
+   * the token chain die" — re-enabling must yield a working account.
+   * Never throws; failures are handled (and classified) inside ensureTokenFresh.
+   * Returns the number of accounts a refresh was attempted for.
+   */
+  async refreshLapsedTokens() {
+    const targets = this.accounts.filter(a =>
+      a.type === 'oauth' && a.refreshToken
+      && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
+    await Promise.all(targets.map(a =>
+      this.ensureTokenFresh(a, a.status === 'error')
+        .catch(() => { /* stays error until the refresh token heals */ })));
+    return targets.length;
   }
 
   /**
