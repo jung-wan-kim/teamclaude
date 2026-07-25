@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isTokenExpiringSoon } from './oauth.js';
+import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -863,6 +863,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // token endpoint still rotates; only new credentials or a restart do.
         account._errorFromRefresh = false;
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
+      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+        // Already parked (e.g. a sweep refresh failed first), but THIS 401 came
+        // back on a still-valid token — that is account-level rejection
+        // evidence, so demote a refresh-caused label: the sweep must not revive
+        // the account on the next token-endpoint success. (A 401 on an EXPIRED
+        // token proves nothing beyond the expiry and keeps its label.)
+        account._errorFromRefresh = false;
       }
       if (logDir) {
         logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);

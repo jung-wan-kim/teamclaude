@@ -184,3 +184,75 @@ test('new external credentials (updateAccountTokens) heal ANY error cause', asyn
   assert.equal(acct.status, 'active', 're-import/login is the verified heal path for upstream-auth errors');
   assert.equal(acct._errorFromRefresh, undefined, 'stale cause label cleared on heal');
 });
+
+// ── race window: 401 landing on an already-parked account ───────────────────
+// A request dispatched while the account was healthy can come back 401 AFTER a
+// failed sweep refresh already parked the account as refresh-caused. If that
+// 401 arrived on a STILL-VALID token it is account-level rejection evidence,
+// and the label must be demoted so the next token-endpoint success does not
+// revive the account (adversarial-review round 2, HIGH). A 401 on an EXPIRED
+// token proves nothing beyond the expiry and must keep the label.
+
+import http from 'node:http';
+import { createProxyServer } from '../src/server.js';
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+async function run401RaceScenario(parkedTokenStillValid) {
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r-a', expiresAt: Date.now() + HOUR },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r-b', expiresAt: Date.now() + HOUR },
+  ], 0.98);
+  am.ensureTokenFresh = async () => {};   // keep the 401 handler's forced refresh off the network
+  const upstream = http.createServer((req, res) => {
+    const auth = req.headers['authorization'] || '';
+    if (auth.includes('tok-a')) {
+      // Park the account WHILE its request is in flight (the race window):
+      // a failed sweep refresh labeled it refresh-caused a moment ago.
+      am.accounts[0].status = 'error';
+      am.accounts[0]._errorFromRefresh = true;
+      if (!parkedTokenStillValid) am.accounts[0].expiresAt = Date.now() - HOUR;
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200, 'failed over to the healthy account');
+    return am.accounts[0];
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => upstream.close(r));
+  }
+}
+
+test('a 401 on a STILL-VALID token demotes a refresh-caused label (sweep must not revive)', async () => {
+  const a = await run401RaceScenario(true);
+  assert.equal(a.status, 'error');
+  assert.equal(a._errorFromRefresh, false,
+    'valid-token 401 is account-level rejection evidence — label demoted');
+});
+
+test('a 401 on an EXPIRED token keeps the refresh-caused label (expiry explains the 401)', async () => {
+  const a = await run401RaceScenario(false);
+  assert.equal(a.status, 'error');
+  assert.equal(a._errorFromRefresh, true,
+    'nothing beyond the expiry was proven — the sweep may still heal this account');
+});
