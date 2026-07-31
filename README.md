@@ -243,6 +243,24 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 9. **Quota survives restarts**: the server snapshots per-account quota/throttle state — plus the committed warm-up probe template — to `<config>.quota.json` (every minute and on exit) and restores both at startup, so a restart doesn't blank the dashboard, blind the use-or-lose ordering, or leave warm-up probes and forced re-measure (TUI **R**) without a known-accepted request shape until traffic flows again. A restored template is provisional: the first freshly accepted request shape replaces it (the snapshot's model may have been retired since). Expired windows are swept lazily and re-measured from live traffic
 10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
+## Troubleshooting
+
+### Session-start context bloat after adopting TeamClaude (claude.ai connectors)
+
+If your Claude Code sessions suddenly begin with hundreds of thousands of tokens already consumed right after setting up TeamClaude, the proxy itself is not eating your context — the claude.ai account (re)login you did during setup most likely is.
+
+- **Mechanism**: `teamclaude login` (and account switching) signs you into claude.ai accounts. Claude Code then syncs that account's claude.ai **connectors** (Slack, Gmail, Figma, Notion, Google Drive/Calendar, …) into every CLI session as remote MCP servers. Their tool schemas alone can add 100–200k tokens at session start — quietly offsetting the very quota you set up TeamClaude to save.
+- **Observed** (2026-07, Claude Code v2.1.220, 4-account rotation): session-start context jumped from ~155k to ~400k tokens on the same day TeamClaude was adopted, with zero local MCP config changes; `claude mcp list` showed nine `claude.ai *` servers that were never registered locally.
+- **Fixes** (all client-side; none of these touch your claude.ai web/app connectors):
+  - Block specific connectors globally in `~/.claude/settings.json`:
+
+    ```json
+    { "deniedMcpServers": [{ "serverName": "claude.ai Figma" }, { "serverName": "claude.ai Google Drive" }] }
+    ```
+  - Or disable account-connector sync entirely: `"disableClaudeAiConnectors": true` (or env `ENABLE_CLAUDEAI_MCP_SERVERS=false`).
+  - Defer the remaining tool schemas so they load on demand: env `ENABLE_TOOL_SEARCH=true` — a fresh interactive session then reports `MCP tools … 0 tokens (loaded on-demand)` in `/context`.
+- **Verify**: run `/context` in a fresh session before/after. In our case the combination above brought session start from ~400k down to ~140k tokens.
+
 ## License
 
 MIT
