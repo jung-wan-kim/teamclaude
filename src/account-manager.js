@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, fetchProfile, isSubscriptionHealthy } from './oauth.js';
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
@@ -62,6 +62,11 @@ export class AccountManager {
       // config with no priorities behaves exactly as before.
       priority: Number.isFinite(acct.priority) ? Math.floor(acct.priority) : null,
       quota: emptyQuota(),
+      // Subscription profile (display/monitoring only — never feeds routing):
+      // { subscriptionStatus, subscriptionCreatedAt, rateLimitTier, orgType,
+      //   hasClaudeMax, hasClaudePro, fetchedAt }. Populated by the profile
+      // sweep (refreshProfiles) and restored from the quota snapshot.
+      profile: null,
       usage: {
         totalInputTokens: 0,
         totalOutputTokens: 0,
@@ -1065,6 +1070,73 @@ export class AccountManager {
   }
 
   /**
+   * Fold a fetched subscription profile into an account, detecting status
+   * transitions. Display/monitoring only — the profile never feeds routing.
+   *
+   * Alerting is transition-scoped: a change INTO an unhealthy status
+   * (past_due, canceled, unpaid, …) warns loudly — including on the FIRST
+   * fetch (prev unknown), since discovering a dead subscription is exactly
+   * what the sweep is for — while a recovery back to healthy logs once as
+   * info. Re-observing the same status is silent, so a broken subscription
+   * doesn't spam the activity log every sweep (the TUI shows it persistently
+   * instead).
+   */
+  updateProfile(accountOrIndex, profile) {
+    const account = this._resolve(accountOrIndex);
+    if (!account || !profile || profile.error) return;
+    const prev = account.profile?.subscriptionStatus ?? null;
+    account.profile = {
+      subscriptionStatus: profile.subscriptionStatus ?? null,
+      subscriptionCreatedAt: profile.subscriptionCreatedAt ?? null,
+      rateLimitTier: profile.rateLimitTier ?? null,
+      orgType: profile.orgType ?? null,
+      hasClaudeMax: profile.hasClaudeMax ?? null,
+      hasClaudePro: profile.hasClaudePro ?? null,
+      fetchedAt: Date.now(),
+    };
+    const next = account.profile.subscriptionStatus;
+    if (next === prev) return;
+    if (!isSubscriptionHealthy(next)) {
+      console.error(`[TeamClaude] ⚠ Subscription for "${account.name}": ${prev ?? 'unknown'} → ${next} — check billing before the account stops serving`);
+    } else if (prev != null && !isSubscriptionHealthy(prev)) {
+      console.log(`[TeamClaude] Subscription for "${account.name}" recovered: ${prev} → ${next}`);
+    }
+  }
+
+  /**
+   * Periodic subscription-profile sweep: fetch each OAuth account's profile
+   * (status / tier / billing anniversary) so the dashboard can show tier
+   * badges and renewal estimates, and a dying subscription (payment failure,
+   * cancellation) is detected without waiting for the account to start
+   * failing requests. Cheap — one profile GET per account, no model quota
+   * spent. Sequential like the token sweep (never burst N GETs), overlapping
+   * sweeps are skipped, and a failed fetch keeps the previous profile (stale
+   * data beats a blinking dashboard). Returns the number of accounts whose
+   * profile was updated. `fetchFn` is injectable for tests.
+   */
+  async refreshProfiles(fetchFn = fetchProfile) {
+    if (this._profileSweepInFlight) return 0;
+    this._profileSweepInFlight = true;
+    try {
+      const targets = this.accounts.filter(a => a.type === 'oauth' && a.credential);
+      let updated = 0;
+      for (const a of targets) {
+        try {
+          // Freshen the token first (coalesced, no-op when still valid) — a
+          // profile GET with an expired token would just 401.
+          await this.ensureTokenFresh(a);
+          if (a.status === 'error' || !a.credential) continue;
+          const p = await fetchFn(a.credential);
+          if (p && !p.error) { this.updateProfile(a, p); updated++; }
+        } catch { /* keep the previous profile — retried next sweep */ }
+      }
+      return updated;
+    } finally {
+      this._profileSweepInFlight = false;
+    }
+  }
+
+  /**
    * Set a callback to persist refreshed tokens to config.
    */
   onTokenRefresh(callback) {
@@ -1112,6 +1184,7 @@ export class AccountManager {
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
+      profile: null,
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
       inflight: 0,
@@ -1247,6 +1320,10 @@ export class AccountManager {
       },
       rateLimitedUntil: a.rateLimitedUntil,
       usage: { ...a.usage },
+      // Subscription profile (credential-free) — restoring it means the tier
+      // badge / renewal estimate shows right after a restart instead of
+      // waiting for the first profile sweep to complete.
+      profile: a.profile ? { ...a.profile } : null,
     }));
   }
 
@@ -1289,6 +1366,10 @@ export class AccountManager {
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
+      // Restore silently (no transition logging) — this is the SAME data from
+      // the previous run, not a fresh observation; the first live sweep after
+      // restart re-fetches and then transition detection applies as usual.
+      if (s.profile && typeof s.profile === 'object') a.profile = { ...s.profile };
       if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
@@ -1317,6 +1398,7 @@ export class AccountManager {
             Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
         },
         usage: { ...a.usage },
+        profile: a.profile ? { ...a.profile } : null,
         inflight: a.inflight,
         maxConcurrent: a.maxConcurrent,
         rateLimitedUntil: a.rateLimitedUntil
