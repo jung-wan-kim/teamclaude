@@ -239,6 +239,21 @@ export function nextRenewalEstimate(createdAtIso, now = new Date()) {
   return candidate;
 }
 
+/**
+ * Whole days from today until `date` (local midnight to local midnight), or
+ * null when the input is absent/unparsable. `0` means the date is today.
+ * Both ends are floored to local midnight so a renewal later today reads as
+ * `0` rather than a fraction rounding to 1.
+ */
+export function daysUntil(date, now = new Date()) {
+  if (!date) return null;
+  const target = new Date(date);
+  if (isNaN(target.getTime())) return null;
+  const a = new Date(target.getFullYear(), target.getMonth(), target.getDate());
+  const b = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((a - b) / 86400000);
+}
+
 // OAuth config (extracted from Claude Code)
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';

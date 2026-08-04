@@ -1,4 +1,4 @@
-import { importCredentials, fetchProfile, isSubscriptionHealthy, tierLabel, nextRenewalEstimate } from './oauth.js';
+import { importCredentials, fetchProfile, isSubscriptionHealthy, tierLabel, nextRenewalEstimate, daysUntil } from './oauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -16,6 +16,21 @@ const yellow = s => fg(33, s);
 const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
+
+// Renewal countdown thresholds (whole days). The estimate is only ever an
+// anniversary guess, so the bands are deliberately coarse and read as a
+// traffic light: red is "this is about to bill", yellow is the near horizon,
+// green is comfortably far out.
+const RENEWAL_URGENT_DAYS = 3;
+const RENEWAL_SOON_DAYS = 7;
+
+// A renewal already due today (or, defensively, a stale past estimate) reads
+// as "D-DAY" rather than "D-0"/"D--2" — the anniversary is the billing day.
+const renewalLabel = days => (days <= 0 ? 'D-DAY' : `D-${days}`);
+const renewalColor = days =>
+  days <= RENEWAL_URGENT_DAYS ? red
+    : days <= RENEWAL_SOON_DAYS ? yellow
+      : green;
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
@@ -827,17 +842,20 @@ export class TUI {
       // API-key accounts have no third metric — pad the slot so the rank
       // badges stay column-aligned across mixed account types.
       line += l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(6 + bw);
-      // Renewal-estimate column (wide terminals only): "↻M/D" is the next
-      // monthly billing anniversary derived from the subscription's creation
-      // date — an estimate, since the API exposes no authoritative period
-      // end. Hidden for unhealthy subscriptions (the red status column
-      // already says the billing is broken; a renewal date would be
-      // misleading). Fixed-width so the rank badges stay aligned.
+      // Renewal-estimate column (wide terminals only): "D-N" counts whole days
+      // to the next monthly billing anniversary derived from the subscription's
+      // creation date — an estimate, since the API exposes no authoritative
+      // period end. A countdown (not a date) is what the reader acts on, and it
+      // is the same quantity the urgency colour keys on. Hidden for unhealthy
+      // subscriptions (the red status column already says the billing is
+      // broken; a renewal date would be misleading). Fixed-width so the rank
+      // badges stay aligned.
       const renew = (a.type === 'oauth' && prof && isSubscriptionHealthy(prof.subscriptionStatus))
         ? nextRenewalEstimate(prof.subscriptionCreatedAt) : null;
-      line += renew
-        ? `  ${dim(`↻${renew.getMonth() + 1}/${renew.getDate()}`.padEnd(6))}`
-        : ' '.repeat(8);
+      const left = daysUntil(renew);
+      line += left == null
+        ? ' '.repeat(8)
+        : `  ${renewalColor(left)(renewalLabel(left).padEnd(6))}`;
     }
     // Order badge: ranked accounts show their 1-based position (#1 = most
     // preferred). While ordering, unranked accounts are labelled "auto" so the

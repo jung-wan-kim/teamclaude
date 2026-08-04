@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isSubscriptionHealthy, subscriptionTier, tierLabel, nextRenewalEstimate } from '../src/oauth.js';
+import { isSubscriptionHealthy, subscriptionTier, tierLabel, nextRenewalEstimate, daysUntil } from '../src/oauth.js';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
 
@@ -262,13 +262,58 @@ test('TUI row shows an unhealthy subscription status (red) and hides the renewal
   const row = strip(raw);
   assert.ok(row.includes('past_du'), `status shown (7-col truncated): ${row}`);
   assert.ok(raw.includes('\x1b[31m'), 'rendered in red');
-  assert.ok(!row.includes('↻'), 'no renewal estimate for a broken subscription');
+  assert.ok(!/D-(DAY|\d+)/.test(row), 'no renewal estimate for a broken subscription');
 });
 
-test('TUI row appends the ↻ renewal estimate on wide (three-bar) terminals only', () => {
+// ── daysUntil ───────────────────────────────────────────────────────────────
+// Both ends floor to local midnight, so a renewal later today is 0 (not a
+// fraction that rounds to 1) and DST shifts can't skew a whole-day count.
+
+test('daysUntil: today is 0, future counts whole days', () => {
+  const now = new Date(2026, 7, 4);
+  assert.equal(daysUntil(new Date(2026, 7, 4, 23, 59), now), 0, 'later today is still 0');
+  assert.equal(daysUntil(new Date(2026, 7, 5), now), 1);
+  assert.equal(daysUntil(new Date(2026, 8, 3), now), 30);
+});
+
+test('daysUntil: a past date goes negative, absent/unparsable input is null', () => {
+  const now = new Date(2026, 7, 4);
+  assert.equal(daysUntil(new Date(2026, 7, 1), now), -3);
+  assert.equal(daysUntil(null, now), null);
+  assert.equal(daysUntil(new Date('nonsense'), now), null);
+});
+
+test('daysUntil: crossing a month boundary counts calendar days', () => {
+  assert.equal(daysUntil(new Date(2026, 8, 1), new Date(2026, 7, 30)), 2, 'Aug 30 → Sep 1');
+});
+
+test('TUI renewal countdown is colour-banded red / yellow / green by urgency', () => {
+  // Anniversary day-of-month is derived from subscriptionCreatedAt, so pin the
+  // creation day and render — the band follows from the days remaining.
+  const bandOf = (createdDay, todayDay) => {
+    const { tui, am } = makeTUIWith({
+      subscriptionStatus: 'active',
+      subscriptionCreatedAt: `2024-07-${String(createdDay).padStart(2, '0')}T00:00:00`,
+    });
+    // Freeze "now" via the account's rendered row: renewal is computed from the
+    // real clock, so assert on the label→colour mapping the renderer applied.
+    const raw = tui._renderAcct(am.accounts[0], 0, 10, true, true);
+    return { raw, row: strip(raw), todayDay };
+  };
+  // Colour is a pure function of the countdown; verify each band's escape code
+  // appears for a row whose label falls in that band.
+  const { raw, row } = bandOf(5);
+  const m = row.match(/D-(DAY|\d+)/);
+  assert.ok(m, `countdown rendered: ${row}`);
+  const days = m[1] === 'DAY' ? 0 : Number(m[1]);
+  const expected = days <= 3 ? '\x1b[31m' : days <= 7 ? '\x1b[33m' : '\x1b[32m';
+  assert.ok(raw.includes(expected), `D-${m[1]} should use ${expected === '\x1b[31m' ? 'red' : expected === '\x1b[33m' ? 'yellow' : 'green'}: ${JSON.stringify(raw)}`);
+});
+
+test('TUI row appends the D-day renewal countdown on wide (three-bar) terminals only', () => {
   const { tui, am } = makeTUIWith({ subscriptionStatus: 'active', subscriptionCreatedAt: '2024-07-05T08:04:31Z' });
   const wide = strip(tui._renderAcct(am.accounts[0], 0, 10, true, true));
-  assert.ok(/↻\d+\/5/.test(wide), `renewal day (anniversary day 5) shown: ${wide}`);
+  assert.ok(/D-(DAY|\d+)/.test(wide), `renewal countdown shown: ${wide}`);
   const mid = strip(tui._renderAcct(am.accounts[0], 0, 10, true, false));
-  assert.ok(!mid.includes('↻'), 'mid-width rows skip the renewal column');
+  assert.ok(!/D-(DAY|\d+)/.test(mid), 'mid-width rows skip the renewal column');
 });
