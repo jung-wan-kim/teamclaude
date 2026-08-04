@@ -826,6 +826,51 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account, rateLimitHeaders);
 
+    // 403 = the account is authenticated but not ENTITLED to serve this request
+    // (e.g. `oauth_not_allowed_for_organization` after a subscription lapses or
+    // an org disables Claude Code access). Unlike a 401 this is not a token
+    // problem, so refreshing cannot fix it — the same credential will be
+    // rejected identically next time. Park the account and fail over, exactly
+    // as the 401 path does once its refresh has been ruled out.
+    //
+    // Without this the 403 fell through to the pass-through response below,
+    // which returns it to the client AND leaves the account 'active': the very
+    // next request selects the same account (it is neither throttled nor
+    // errored) and fails again, so ONE lapsed account in the fleet can serve
+    // every request with a 403 while healthy accounts sit idle.
+    if (upstreamRes.status === 403) {
+      await upstreamRes.body?.cancel();
+
+      if (account.status !== 'error') {
+        account.status = 'error';
+        // Upstream rejected the ACCOUNT, not its token — the keep-alive sweep
+        // must not revive it just because the token endpoint still rotates.
+        // Only new credentials or a restart bring it back (same rule the 401
+        // path applies to a rejection that survived a refresh).
+        account._errorFromRefresh = false;
+        console.log(`[TeamClaude] 403 on "${account.name}" — account not entitled, marking account error`);
+      }
+      if (logDir) {
+        logSections.push(`=== RESPONSE 403 — not entitled, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (res.destroyed) return;
+      if (retryCount < maxRetries) {
+        releaseHeld(); // this account is now 'error'; fail over to another
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+      // Every account we tried is unentitled — surface it rather than looping.
+      ctx.status = 403;
+      if (!res.headersSent) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'permission_error', message: 'All accounts were refused by upstream (not entitled).' },
+        }));
+      }
+      return;
+    }
+
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token
