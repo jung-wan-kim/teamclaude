@@ -262,6 +262,16 @@ If your Claude Code sessions suddenly begin with hundreds of thousands of tokens
   - Defer the remaining tool schemas so they load on demand: env `ENABLE_TOOL_SEARCH=true` — a fresh interactive session then reports `MCP tools … 0 tokens (loaded on-demand)` in `/context`.
 - **Verify**: run `/context` in a fresh session before/after. In our case the combination above brought session start from ~400k down to ~140k tokens.
 
+## Contributors
+
+Thanks to everyone who has sent a pull request — every feature below shipped from one.
+
+| Contributor | Contribution |
+|---|---|
+| [@soulduse](https://github.com/soulduse) | **403 failover** ([#5](https://github.com/jung-wan-kim/teamclaude/pull/5)) — parks an unentitled account instead of letting one lapsed subscription serve the whole fleet with 403s.<br>**Subscription monitoring** ([#4](https://github.com/jung-wan-kim/teamclaude/pull/4)) — per-account status, tier badge and renewal countdown on the dashboard, so a dying subscription is caught by an alert rather than by failing requests. |
+| [@Baek-Seunghyun](https://github.com/Baek-Seunghyun) | **Pooled FLEET row** ([#2](https://github.com/jung-wan-kim/teamclaude/pull/2)) — one summary row above the account list answering "how much runway is left across everything, and when does more arrive", with disabled and parked accounts deliberately excluded so the number stays honest. |
+| [@treylom](https://github.com/treylom) | **Connector context-bloat troubleshooting** ([#3](https://github.com/jung-wan-kim/teamclaude/pull/3)) — documents why session-start context can jump after adopting TeamClaude, and the client-side settings that bring it back down. |
+
 ## License
 
 MIT
