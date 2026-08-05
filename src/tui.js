@@ -128,6 +128,77 @@ function timestamp() {
 
 // ── TUI class ────────────────────────────────────────────────
 
+/**
+ * Pool the fleet's quota into one set of numbers.
+ *
+ * With several accounts the dashboard shows N rows of bars, but the question
+ * behind them is usually singular: how much runway is left across everything,
+ * and when does more arrive? That is an average and a minimum — arithmetic the
+ * dashboard can do instead of the reader.
+ *
+ * Rules that make the number honest:
+ * - **Disabled accounts are excluded.** They serve no traffic, so folding them
+ *   in would report capacity that cannot be used.
+ * - **Unmeasured windows are skipped, not counted as zero.** An account that has
+ *   not been measured yet would otherwise drag the pooled figure down and read
+ *   as free capacity that nobody has confirmed exists.
+ * - **The countdown is the SOONEST reset in the pool**, not the average: it
+ *   answers "when does the next slice of capacity come back".
+ * - A mixed pool reports the **unified (Max) windows** when any OAuth account is
+ *   present, since Ses/Wk and Tok/Req are different quantities and averaging
+ *   them together would be meaningless.
+ *
+ * Returns `null` for a pool of fewer than two accounts — with one account the
+ * row below already is the total.
+ */
+export function poolQuota(accounts = []) {
+  const pool = accounts.filter(a => a.enabled !== false);
+  if (pool.length < 2) return null;
+
+  const oauth = pool.filter(a => a.type === 'oauth');
+  const unified = oauth.length > 0;
+  const src = unified ? oauth : pool;
+
+  const agg = (pick) => {
+    const vals = [], resets = [];
+    for (const a of src) {
+      const [v, t] = pick(a.quota || {});
+      if (v == null || Number.isNaN(v)) continue;
+      vals.push(v);
+      if (t) resets.push(t);
+    }
+    if (!vals.length) return { util: null, reset: null, n: 0 };
+    return {
+      util: vals.reduce((s, v) => s + v, 0) / vals.length,
+      reset: resets.length ? Math.min(...resets) : null,
+      n: vals.length,
+    };
+  };
+
+  const ratio = (limit, remaining) =>
+    (limit != null && remaining != null && limit > 0) ? 1 - remaining / limit : null;
+  const stdReset = q => (q.resetsAt ? new Date(q.resetsAt).getTime() : null);
+
+  const cols = unified
+    ? [
+      agg(q => [q.unified5h, q.unified5hReset]),
+      agg(q => [q.unified7d, q.unified7dReset]),
+      agg(q => {
+        // Same preference as the per-account row: the explicit 7d_oi (Fable)
+        // window first, else whatever model-scoped window exists.
+        const w = q.modelWeekly?.['7d_oi'] || Object.values(q.modelWeekly || {})[0];
+        return [w?.utilization, w?.reset];
+      }),
+    ]
+    : [
+      agg(q => [ratio(q.tokensLimit, q.tokensRemaining), stdReset(q)]),
+      agg(q => [ratio(q.requestsLimit, q.requestsRemaining), stdReset(q)]),
+      { util: null, reset: null, n: 0 },
+    ];
+
+  return { size: pool.length, unified, cols };
+}
+
 export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, onQuit }) {
     this.am = accountManager;
@@ -697,6 +768,8 @@ export class TUI {
       // display order may have changed since the last frame (quota updates
       // re-sort the auto group), and the highlight must follow the account.
       this._selected();
+      const total = this._renderFleetTotal(bw, showBoth, showThree);
+      if (total) lines.push(total);
       const display = this._displayList();
       for (let pos = 0; pos < display.length; pos++) {
         lines.push(this._renderAcct(display[pos], pos, bw, showBoth, showThree));
@@ -742,6 +815,36 @@ export class TUI {
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     process.stdout.write(buf);
+  }
+
+  /**
+   * The pooled row, drawn on the account list's columns so its bars sit
+   * directly above the per-account ones (the selection/current/number gutters
+   * are blank — the pool is not selectable). Returns null when there is nothing
+   * worth pooling; see poolQuota() for what the numbers mean.
+   */
+  _renderFleetTotal(bw, showBoth, showThree) {
+    const pool = poolQuota(this.am.accounts);
+    if (!pool) return null;
+    const [c1, c2, c3] = pool.cols;
+    const l1 = pool.unified ? 'Ses' : 'Tok';
+    const l2 = pool.unified ? 'Wk ' : 'Req';
+    const disabled = this.am.accounts.length - pool.size;
+    // "×N" counts the accounts in rotation; a trailing "+M off" makes it obvious
+    // the pooled figure deliberately ignores disabled accounts rather than
+    // having silently lost them.
+    const size = `×${pool.size}${disabled ? ` +${disabled} off` : ''}`;
+
+    // Blank gutters matching _renderAcct's prefix exactly — leading space,
+    // selection marker, current marker, space, row number (2 cols + '.'), space
+    // — so the pooled bars line up with the per-account bars below.
+    const gutter = ' '.repeat(1 + 1 + 1 + 1 + 3 + 1);
+    let line = `${gutter}${bold(rpad('FLEET', 12))} ${gray(rpad(size, 7))} ${gray(rpad('pooled', 10))} ${l1} ${bar(c1.util, bw, c1.reset)}`;
+    if (showBoth) line += `  ${l2} ${bar(c2.util, bw, c2.reset)}`;
+    if (showThree) {
+      line += pool.unified ? `  Fbl ${bar(c3.util, bw, c3.reset)}` : ' '.repeat(6 + bw);
+    }
+    return line;
   }
 
   _renderAcct(a, pos, bw, showBoth, showThree = false) {
