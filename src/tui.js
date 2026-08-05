@@ -152,7 +152,14 @@ function timestamp() {
  * row below already is the total.
  */
 export function poolQuota(accounts = []) {
-  const pool = accounts.filter(a => a.enabled !== false);
+  // Parked accounts are excluded for the same reason disabled ones are: they
+  // serve no traffic, so folding them in reports capacity that cannot be used.
+  // A parked account keeps whatever quota reading it had when it failed, so
+  // leaving it in drags the pooled figure DOWN and shows runway that does not
+  // exist. 'throttled'/'exhausted' accounts stay in — their quota genuinely
+  // does come back, and the soonest-reset countdown is precisely the answer to
+  // "when does more capacity arrive".
+  const pool = accounts.filter(a => a.enabled !== false && a.status !== 'error');
   if (pool.length < 2) return null;
 
   const oauth = pool.filter(a => a.type === 'oauth');

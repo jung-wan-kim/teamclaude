@@ -841,7 +841,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (upstreamRes.status === 403) {
       await upstreamRes.body?.cancel();
 
-      if (account.status !== 'error') {
+      // Parking is PERSISTENT (recovery is re-login or restart), and a 403 does
+      // not always mean "this account lapsed": an edge/WAF block, an org-policy
+      // blip, or a per-request entitlement refusal all surface as 403 too. If
+      // this is the LAST account the fleet can still use, parking it converts a
+      // transient refusal into a dead proxy that no rotation can recover from —
+      // the same fleet-wide outage this branch exists to prevent, just reached
+      // from the other side. So park only while somewhere else is left to go;
+      // otherwise leave the account active and let the failure stay per-request
+      // and self-healing. Deliberately NOT keyed on the upstream error code:
+      // which codes mean "lapsed" is an upstream detail we cannot pin down from
+      // here, and guessing wrong would silently disable the parking entirely.
+      const elsewhere = new Set([account]);
+      const canPark = accountManager.anyUsable(elsewhere) || accountManager.anyCapped(elsewhere);
+
+      if (account.status !== 'error' && canPark) {
         account.status = 'error';
         // Upstream rejected the ACCOUNT, not its token — the keep-alive sweep
         // must not revive it just because the token endpoint still rotates.
@@ -849,9 +863,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // path applies to a rejection that survived a refresh).
         account._errorFromRefresh = false;
         console.log(`[TeamClaude] 403 on "${account.name}" — account not entitled, marking account error`);
+      } else if (!canPark) {
+        console.log(`[TeamClaude] 403 on "${account.name}" — last usable account, keeping it active`);
       }
       if (logDir) {
-        logSections.push(`=== RESPONSE 403 — not entitled, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 403 — not entitled, account ${canPark ? 'marked error' : 'kept active (last usable)'} ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;

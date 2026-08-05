@@ -118,11 +118,12 @@ test('a parked (403) account is not selected again on the next request', async (
 });
 
 // When every account is unentitled the proxy must stop rather than recurse
-// forever. The failover parks each account in turn; once none is selectable
-// the existing "every account is in error state" guard answers the client —
-// so the contract asserted here is bounded retries + every account parked,
-// not the specific status code that guard chose.
-test('all accounts unentitled → bounded retries, every account parked', async () => {
+// forever. The failover parks each account in turn until only one usable
+// account is left, which it deliberately leaves active (see the assertions
+// below) — so the contract asserted here is bounded retries + all-but-the-last
+// parked + the fleet never left with nothing selectable, not the specific
+// status code whichever exhaustion guard happened to answer with.
+test('all accounts unentitled → bounded retries, all but the last account parked', async () => {
   let hits = 0;
   const upstream = http.createServer((req, res) => {
     hits++;
@@ -154,7 +155,17 @@ test('all accounts unentitled → bounded retries, every account parked', async 
     // all-accounts-in-error guard's 401 once nothing is selectable).
     assert.ok(res.status === 403 || res.status === 401, `got ${res.status}`);
     assert.ok(hits >= 1 && hits <= 4, `retries must stay bounded, got ${hits} upstream hits`);
-    assert.ok(am.accounts.every(a => a.status === 'error'), 'every tried account parked');
+    // Every account EXCEPT the last usable one is parked. The 403 path
+    // deliberately stops short of parking the final account: parking is
+    // persistent (recovery is re-login or restart), so draining the fleet on a
+    // refusal that might be an edge/WAF block or an org-policy blip would turn
+    // a transient failure into a proxy no rotation can recover from. The last
+    // account stays active and keeps surfacing the refusal per-request, which
+    // is both visible and self-healing.
+    const parked = am.accounts.filter(a => a.status === 'error').length;
+    assert.equal(parked, am.accounts.length - 1, 'all but the last usable account are parked');
+    assert.ok(am.accounts.some(a => a.status === 'active'),
+      'the fleet must never be left with nothing selectable');
   } finally {
     proxy.close();
     upstream.close();
