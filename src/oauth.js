@@ -159,10 +159,99 @@ export async function fetchProfile(accessToken) {
       orgType: data.organization?.organization_type,
       hasClaudeMax: data.account?.has_claude_max,
       hasClaudePro: data.account?.has_claude_pro,
+      // Subscription monitoring fields. The profile endpoint exposes no
+      // expiry / next-billing date — only the status and the original
+      // subscription creation instant (whose day-of-month is the billing
+      // anniversary; see nextRenewalEstimate below).
+      subscriptionStatus: data.organization?.subscription_status ?? null,
+      subscriptionCreatedAt: data.organization?.subscription_created_at ?? null,
+      rateLimitTier: data.organization?.rate_limit_tier ?? null,
     };
   } catch (err) {
     return { error: err.message || String(err) };
   }
+}
+
+// ── subscription helpers (pure — no proxy state) ─────────────
+
+/**
+ * Is a subscription status healthy (billing intact)? `null`/unknown counts as
+ * healthy — an account whose profile hasn't been fetched yet must not render
+ * as broken. Anything else (past_due, canceled, unpaid, incomplete, paused…)
+ * is surfaced as a problem.
+ */
+export function isSubscriptionHealthy(status) {
+  return status == null || status === 'active' || status === 'trialing';
+}
+
+/**
+ * Short tier label from a profile: '20x' / '5x' (from the rate_limit_tier
+ * suffix, e.g. default_claude_max_20x), else 'Max' / 'Pro' from the plan
+ * flags, else null when nothing is known.
+ */
+export function subscriptionTier(profile) {
+  if (!profile) return null;
+  const m = /(\d+x)$/.exec(profile.rateLimitTier || '');
+  if (m) return m[1];
+  if (profile.hasClaudeMax || profile.orgType === 'claude_max') return 'Max';
+  if (profile.hasClaudePro || profile.orgType === 'claude_pro') return 'Pro';
+  return null;
+}
+
+/**
+ * Display label for the tier: '20x'/'5x' read as "Max 20x"/"Max 5x", the
+ * plan-flag fallbacks ('Max'/'Pro') pass through, null stays null. Shared by
+ * the TUI type column and the `accounts` command so the composition lives in
+ * one place.
+ */
+export function tierLabel(profile) {
+  const tier = subscriptionTier(profile);
+  if (!tier) return null;
+  return /^\d+x$/.test(tier) ? `Max ${tier}` : tier;
+}
+
+/**
+ * ESTIMATED next renewal date (local), derived from the subscription's
+ * creation instant: monthly billing renews on the same day-of-month it was
+ * created (clamped to shorter months, matching Stripe's anchor behavior).
+ * This is an estimate — the API exposes no authoritative period end, and an
+ * annual plan or a mid-cycle plan change shifts the real date — so callers
+ * must label it as approximate ("~"). Returns a Date at local midnight, or
+ * null when the input is absent/unparsable. Today still counts as "next"
+ * (the renewal happens on this date).
+ */
+export function nextRenewalEstimate(createdAtIso, now = new Date()) {
+  if (!createdAtIso) return null;
+  const created = new Date(createdAtIso);
+  if (isNaN(created.getTime())) return null;
+  const day = created.getDate();
+  // Clamp the anchor day to the target month's length (Jan 31 → Feb 28/29).
+  const clampDay = (y, m) => Math.min(day, new Date(y, m + 1, 0).getDate());
+  let y = now.getFullYear();
+  let m = now.getMonth();
+  let candidate = new Date(y, m, clampDay(y, m));
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (candidate < today) {
+    m += 1;
+    if (m > 11) { m = 0; y += 1; }
+    candidate = new Date(y, m, clampDay(y, m));
+  }
+  return candidate;
+}
+
+/**
+ * Whole days from today until `date` (local midnight to local midnight), or
+ * null when the input is absent/unparsable. `0` means the date is today.
+ * Both ends are floored to local midnight so a renewal later today reads as
+ * `0` rather than a fraction rounding to 1.
+ */
+export function daysUntil(date, now = new Date()) {
+  if (!date) return null;
+  const target = new Date(date);
+  if (isNaN(target.getTime())) return null;
+  const a = new Date(target.getFullYear(), target.getMonth(), target.getDate());
+  const b = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((a - b) / 86400000);
 }
 
 // OAuth config (extracted from Claude Code)

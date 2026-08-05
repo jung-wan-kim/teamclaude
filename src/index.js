@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, subscriptionTier, tierLabel, nextRenewalEstimate } from './oauth.js';
 import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
@@ -294,6 +294,20 @@ async function serverCommand() {
     if (tokenRefreshIntervalMs > 0) {
       setImmediate(() => accountManager.refreshLapsedTokens());
       setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs).unref();
+    }
+    // Subscription-profile sweep: fetch each OAuth account's profile (status /
+    // tier / billing anniversary) so the dashboard shows tier badges and
+    // renewal estimates, and a dying subscription (payment failure /
+    // cancellation) raises an activity-log alert instead of silently failing
+    // requests later. One immediate sweep populates the fleet right after
+    // startup (the quota snapshot restores the previous run's profiles in the
+    // meantime). Default 6h — subscription state changes rarely; `0` disables.
+    const profileRefreshIntervalMs = Number.isFinite(config.profileRefreshIntervalMs)
+      ? Math.max(0, config.profileRefreshIntervalMs)
+      : 6 * 3600_000;
+    if (profileRefreshIntervalMs > 0) {
+      setImmediate(() => accountManager.refreshProfiles());
+      setInterval(() => accountManager.refreshProfiles(), profileRefreshIntervalMs).unref();
     }
     if (tui) {
       tui.start();
@@ -663,6 +677,11 @@ async function runCommand() {
 
 // ── status ──────────────────────────────────────────────────
 
+/** YYYY-MM-DD (local) for the renewal-estimate lines in status/accounts. */
+function formatRenewalDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 async function statusCommand() {
   const config = await loadOrCreateConfig();
   // Locate the actual running server (its bound port may differ from the current
@@ -693,6 +712,16 @@ async function statusCommand() {
       console.log(`  ${acct.name} (${acct.type})${current}${disabledTag}`);
       console.log(`    Status:   ${acct.status}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
       if (acct.priority != null) console.log(`    Priority: ${acct.priority} (lower = preferred)`);
+      // Subscription line (?. — a status payload from an older running server
+      // has no profile field). Renewal is an ESTIMATE from the billing
+      // anniversary — the API exposes no authoritative period end.
+      if (acct.profile?.subscriptionStatus) {
+        const tier = subscriptionTier(acct.profile);
+        const renew = nextRenewalEstimate(acct.profile.subscriptionCreatedAt);
+        let line = `    Sub:      ${acct.profile.subscriptionStatus}${tier ? ` (${tier})` : ''}`;
+        if (renew) line += `, renews ~${formatRenewalDate(renew)}`;
+        console.log(line);
+      }
       if (acct.maxConcurrent != null) {
         console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
       }
@@ -800,12 +829,18 @@ async function accountsCommand() {
 
     // OAuth account
     const hasProfile = p && !p.error;
-    const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
+    // Prefer the precise tier from rate_limit_tier ('20x'/'5x' → "Max 20x")
+    // over the coarse plan flags.
+    const tier = hasProfile ? (tierLabel(p) || 'subscription') : null;
     const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
+    if (hasProfile && p.subscriptionStatus) {
+      const renew = nextRenewalEstimate(p.subscriptionCreatedAt);
+      console.log(`       Sub:   ${p.subscriptionStatus}${renew ? `, renews ~${formatRenewalDate(renew)}` : ''}`);
+    }
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {

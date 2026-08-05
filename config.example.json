@@ -11,6 +11,7 @@
   "activeWarmup": true,
   "warmupIntervalMs": 300000,
   "tokenRefreshIntervalMs": 300000,
+  "profileRefreshIntervalMs": 21600000,
   "accounts": [
     {
       "name": "primary-max",

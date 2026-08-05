@@ -1,4 +1,4 @@
-import { importCredentials, fetchProfile } from './oauth.js';
+import { importCredentials, fetchProfile, isSubscriptionHealthy, tierLabel, nextRenewalEstimate, daysUntil } from './oauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -16,6 +16,21 @@ const yellow = s => fg(33, s);
 const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
+
+// Renewal countdown thresholds (whole days). The estimate is only ever an
+// anniversary guess, so the bands are deliberately coarse and read as a
+// traffic light: red is "this is about to bill", yellow is the near horizon,
+// green is comfortably far out.
+const RENEWAL_URGENT_DAYS = 3;
+const RENEWAL_SOON_DAYS = 7;
+
+// A renewal already due today (or, defensively, a stale past estimate) reads
+// as "D-DAY" rather than "D-0"/"D--2" — the anniversary is the billing day.
+const renewalLabel = days => (days <= 0 ? 'D-DAY' : `D-${days}`);
+const renewalColor = days =>
+  days <= RENEWAL_URGENT_DAYS ? red
+    : days <= RENEWAL_SOON_DAYS ? yellow
+      : green;
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
@@ -669,9 +684,11 @@ export class TUI {
       const showBoth = W >= 70;
       // The +4 in each offset reserves the width of the leading row-number
       // column (" NN." + its separator), so adding it doesn't push the bars
-      // past the terminal edge and clip the rightmost (Fbl) bar.
+      // past the terminal edge and clip the rightmost (Fbl) bar. The
+      // three-bar offset additionally reserves 8 columns for the
+      // renewal-estimate column ("  ↻M/D  ") appended after the Fbl bar.
       const bw = showThree
-        ? Math.max(5, Math.min(20, Math.floor((W - 66) / 3)))
+        ? Math.max(5, Math.min(20, Math.floor((W - 74) / 3)))
         : showBoth
           ? Math.max(5, Math.min(20, Math.floor((W - 60) / 2)))
           : Math.max(5, Math.min(20, W - 49));
@@ -747,8 +764,20 @@ export class TUI {
     const rawName = a.name.slice(0, 12).padEnd(12);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type
-    const type = gray(a.type.padEnd(7));
+    // Type column doubles as the subscription column for OAuth accounts once
+    // the profile sweep has run: the tier badge ("Max 20x"/"Max 5x"/"Pro")
+    // replaces the literal 'oauth', and an UNHEALTHY subscription (past_due /
+    // canceled / unpaid …) shows its status in red instead — the persistent
+    // indicator matching the one-shot transition alert in the activity log.
+    // Falls back to the plain type while no profile is known.
+    let type;
+    const prof = a.profile;
+    if (a.type === 'oauth' && prof && !isSubscriptionHealthy(prof.subscriptionStatus)) {
+      type = red((prof.subscriptionStatus || 'inactive').slice(0, 7).padEnd(7));
+    } else {
+      const label = (a.type === 'oauth' && tierLabel(prof)) || a.type;
+      type = gray(label.slice(0, 7).padEnd(7));
+    }
 
     // Status — a manually-disabled account reads "disabled" regardless of its
     // underlying quota status, since it's out of rotation either way.
@@ -813,6 +842,20 @@ export class TUI {
       // API-key accounts have no third metric — pad the slot so the rank
       // badges stay column-aligned across mixed account types.
       line += l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(6 + bw);
+      // Renewal-estimate column (wide terminals only): "D-N" counts whole days
+      // to the next monthly billing anniversary derived from the subscription's
+      // creation date — an estimate, since the API exposes no authoritative
+      // period end. A countdown (not a date) is what the reader acts on, and it
+      // is the same quantity the urgency colour keys on. Hidden for unhealthy
+      // subscriptions (the red status column already says the billing is
+      // broken; a renewal date would be misleading). Fixed-width so the rank
+      // badges stay aligned.
+      const renew = (a.type === 'oauth' && prof && isSubscriptionHealthy(prof.subscriptionStatus))
+        ? nextRenewalEstimate(prof.subscriptionCreatedAt) : null;
+      const left = daysUntil(renew);
+      line += left == null
+        ? ' '.repeat(8)
+        : `  ${renewalColor(left)(renewalLabel(left).padEnd(6))}`;
     }
     // Order badge: ranked accounts show their 1-based position (#1 = most
     // preferred). While ordering, unranked accounts are labelled "auto" so the
