@@ -1,3 +1,15 @@
 node_modules/
 config.json
 *.log
+
+# QA gate evidence — must stay out of the tracked tree, otherwise writing the
+# evidence changes the state fingerprint it is bound to and invalidates itself.
+.qa-cycle-passed
+.qa-evidence.json
+.codex-review-passed
+.codex-review-output
+.completion-check.md
+
+# Claude Code local permissions — never commit (public repo)
+.claude/settings.local.json
+.claude/worktrees/
