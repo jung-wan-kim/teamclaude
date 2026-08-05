@@ -55,13 +55,18 @@ test('a 403 on the LAST usable account keeps it active instead of emptying the f
     assert.equal(await send(), 403, 'the refusal is surfaced to the client');
     assert.equal(am.accounts[0].status, 'active',
       'the only account must stay in rotation — parking it would kill the proxy');
+    // Exactly one upstream hit. Retrying here would hand the same still-active
+    // account straight back, so it buys nothing and costs a second 403 — a
+    // duplicate delivery of a possibly non-idempotent body, and double load on
+    // an upstream that is already refusing. Asserting "hits went up" is too
+    // weak to catch that; the count has to be exact.
+    assert.equal(hits, 1, `one client request must cost one upstream 403, got ${hits}`);
 
-    // The decisive part: a second request must still reach upstream. If the
-    // account had been parked, selection would find nothing and the request
-    // would never leave the proxy.
-    const before = hits;
-    await send();
-    assert.ok(hits > before, 'the fleet must still be able to dispatch after a 403');
+    // And the fleet is still able to dispatch: a second request reaches
+    // upstream too (if the account had been parked, selection would find
+    // nothing and the request would never leave the proxy).
+    assert.equal(await send(), 403, 'second request still reaches upstream');
+    assert.equal(hits, 2, `second request must add exactly one more hit, got ${hits}`);
   } finally {
     proxy.close();
     upstream.close();

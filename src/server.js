@@ -871,11 +871,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;
-      if (retryCount < maxRetries) {
+      // Only retry once this account is actually out of the way. When it was
+      // kept active (last usable), selection would hand the very same account
+      // back, so a retry buys nothing and costs a second upstream 403 — a
+      // duplicate delivery of a possibly non-idempotent body, and double load
+      // on an upstream that is already refusing.
+      if (canPark && retryCount < maxRetries) {
         releaseHeld(); // this account is now 'error'; fail over to another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
-      // Every account we tried is unentitled — surface it rather than looping.
+      // Nowhere left to fail over to — surface the refusal rather than looping.
       ctx.status = 403;
       if (!res.headersSent) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
