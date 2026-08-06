@@ -855,19 +855,39 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const elsewhere = new Set([account]);
       const canPark = accountManager.anyUsable(elsewhere) || accountManager.anyCapped(elsewhere);
 
-      if (account.status !== 'error' && canPark) {
+      // Escalating backoff before anything permanent. A single 403 is weak
+      // evidence: an edge/WAF block, an org-policy blip, or a refusal scoped to
+      // THIS request (a model or feature the plan doesn't cover) all look
+      // identical from here — and every account in the fleet leaves through the
+      // same egress IP, so an IP-level block would otherwise park them one by
+      // one. A cooldown costs one probe per window and heals itself; permanent
+      // parking costs a human re-login. Only a run of consecutive 403s is
+      // evidence of a genuine entitlement loss, and that is what parks.
+      const F403_PARK_AFTER = 5;   // consecutive 403s before parking for good
+      const F403_BASE_S = 60;      // first cooldown
+      const F403_MAX_S = 300;      // matches the 429 throttle ceiling
+      const strikes = (account._403Strikes = (account._403Strikes || 0) + 1);
+
+      let steppedAside = false;    // did this account actually leave rotation?
+      if (!canPark) {
+        console.log(`[TeamClaude] 403 on "${account.name}" — last usable account, keeping it active`);
+      } else if (strikes >= F403_PARK_AFTER) {
         account.status = 'error';
         // Upstream rejected the ACCOUNT, not its token — the keep-alive sweep
         // must not revive it just because the token endpoint still rotates.
         // Only new credentials or a restart bring it back (same rule the 401
         // path applies to a rejection that survived a refresh).
         account._errorFromRefresh = false;
-        console.log(`[TeamClaude] 403 on "${account.name}" — account not entitled, marking account error`);
-      } else if (!canPark) {
-        console.log(`[TeamClaude] 403 on "${account.name}" — last usable account, keeping it active`);
+        steppedAside = true;
+        console.log(`[TeamClaude] 403 on "${account.name}" ×${strikes} — not entitled, parking (re-login to restore)`);
+      } else {
+        const cool = Math.min(F403_MAX_S, F403_BASE_S * 2 ** (strikes - 1));
+        accountManager.markRateLimited(account, cool);
+        steppedAside = true;
+        console.log(`[TeamClaude] 403 on "${account.name}" ×${strikes} — cooling down ${cool}s (auto-recovers)`);
       }
       if (logDir) {
-        logSections.push(`=== RESPONSE 403 — not entitled, account ${canPark ? 'marked error' : 'kept active (last usable)'} ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 403 — strike ${strikes}, account ${steppedAside ? (account.status === 'error' ? 'parked' : 'cooled down') : 'kept active (last usable)'} ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;
@@ -876,8 +896,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // back, so a retry buys nothing and costs a second upstream 403 — a
       // duplicate delivery of a possibly non-idempotent body, and double load
       // on an upstream that is already refusing.
-      if (canPark && retryCount < maxRetries) {
-        releaseHeld(); // this account is now 'error'; fail over to another
+      if (steppedAside && retryCount < maxRetries) {
+        releaseHeld(); // this account left rotation; fail over to another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
       // Nowhere left to fail over to — surface the refusal rather than looping.
@@ -1119,6 +1139,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
 
     ctx.status = upstreamRes.status;
+
+    // This account answered without a 403, so whatever refused it earlier was
+    // not a standing entitlement problem — clear the strike run that would
+    // otherwise creep toward a permanent park across unrelated incidents.
+    if (account._403Strikes) account._403Strikes = 0;
 
     // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};

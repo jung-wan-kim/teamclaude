@@ -106,7 +106,9 @@ test('a 403 still parks the account while another one can take over', async () =
     });
     await res.text();
     assert.equal(res.status, 200, 'failed over to the entitled account');
-    assert.equal(am.accounts[0].status, 'error', 'still parked — a healthy account was available');
+    assert.equal(am.accounts[0].status, 'throttled',
+      'still leaves rotation — a healthy account was available to take over');
+    assert.equal(am.accounts[0]._403Strikes, 1, 'one strike recorded');
   } finally {
     proxy.close();
     upstream.close();
@@ -139,4 +141,65 @@ test('poolQuota keeps throttled and exhausted accounts — their quota does come
   const p = poolQuota([mk('a', 0.5), mk('b', 1.0, { status: 'throttled' })]);
   assert.equal(p.size, 2, 'a throttled account still holds real, returning capacity');
   assert.ok(Math.abs(p.cols[0].util - 0.75) < 1e-9, 'its utilisation counts toward the pool');
+});
+
+// ── a 403 must not cost a human re-login ─────────────────────
+//
+// The whole fleet leaves through one egress IP, so an IP-level block returns
+// 403 for accounts whose subscriptions are perfectly fine. Parking those
+// permanently would mean re-registering healthy accounts by hand. The cooldown
+// has to heal itself, and only a sustained run of 403s — real evidence of an
+// entitlement loss — may cost an operator anything.
+
+async function drive403(accountCount, sends) {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    Array.from({ length: accountCount }, (_, i) => ({
+      name: `a${i}`, type: 'oauth', accessToken: `tok-${i}`, refreshToken: 'r',
+      expiresAt: Date.now() + 3600_000,
+    })), 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  for (let i = 0; i < sends; i++) {
+    // Rewind any cooldown so the next send actually reaches the account again —
+    // this is what a caller arriving after the window would see.
+    for (const a of am.accounts) if (a.rateLimitedUntil) a.rateLimitedUntil = Date.now() - 1;
+    const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await r.text();
+  }
+  proxy.close(); upstream.close();
+  return am;
+}
+
+test('a cooled-down account returns to rotation on its own, with no re-login', async () => {
+  const am = await drive403(2, 1);
+  const hit = am.accounts.find(a => a.status === 'throttled');
+  assert.ok(hit, 'the refused account was cooled down rather than parked');
+  assert.notEqual(hit.status, 'error', 'no operator action should be required');
+
+  // Let the window lapse — availability alone must bring it back.
+  hit.rateLimitedUntil = Date.now() - 1;
+  assert.equal(am._isAvailable(hit), true, 'selectable again once the cooldown lapses');
+  assert.equal(hit.status, 'active', 'and restored to active without any credential change');
+});
+
+test('a sustained run of 403s does eventually park — that is what re-login is for', async () => {
+  // Five consecutive refusals on the same account is no longer plausibly a
+  // transient block; at that point parking (and telling the operator) is right.
+  const am = await drive403(2, 6);
+  assert.ok(am.accounts.some(a => a.status === 'error'),
+    'a sustained run must still reach a permanent park');
+  const parked = am.accounts.find(a => a.status === 'error');
+  assert.equal(parked._errorFromRefresh, false,
+    'upstream rejected the ACCOUNT — the token sweep must not revive it');
+  assert.ok(parked._403Strikes >= 5, `park only after the run, got ${parked._403Strikes}`);
 });

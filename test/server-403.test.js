@@ -63,9 +63,16 @@ test('a 403 marks the account error and switches to a healthy account', async ()
     // A refresh cannot fix a 403, so the account must not be retried even
     // though it HAS a usable refresh token (this is what separates it from 401).
     assert.equal(aHits, 1, `unentitled account must not be retried, got ${aHits} hits`);
-    assert.equal(am.accounts[0].status, 'error', 'parked → out of rotation and warm-up');
-    assert.equal(am.accounts[0]._errorFromRefresh, false,
-      'upstream rejected the ACCOUNT — the token sweep must not revive it');
+    // The invariant is that the refused account LEAVES rotation — not that it
+    // leaves permanently. A single 403 is weak evidence (edge/WAF block, a
+    // refusal scoped to this one request), and every account shares the proxy's
+    // egress IP, so an immediate permanent park would cost a human re-login for
+    // something that heals itself. The first strikes are a cooldown.
+    assert.equal(am.accounts[0].status, 'throttled', 'out of rotation after one 403');
+    assert.ok(am.accounts[0].rateLimitedUntil > Date.now(),
+      'the cooldown must be in the future so selection actually skips it');
+    assert.notEqual(am.accounts[0].status, 'error',
+      'one 403 must not cost a re-login — that is reserved for a run of them');
   } finally {
     proxy.close();
     upstream.close();
@@ -162,8 +169,8 @@ test('all accounts unentitled → bounded retries, all but the last account park
     // a transient failure into a proxy no rotation can recover from. The last
     // account stays active and keeps surfacing the refusal per-request, which
     // is both visible and self-healing.
-    const parked = am.accounts.filter(a => a.status === 'error').length;
-    assert.equal(parked, am.accounts.length - 1, 'all but the last usable account are parked');
+    const out = am.accounts.filter(a => a.status === 'throttled' || a.status === 'error').length;
+    assert.equal(out, am.accounts.length - 1, 'all but the last usable account left rotation');
     assert.ok(am.accounts.some(a => a.status === 'active'),
       'the fleet must never be left with nothing selectable');
   } finally {
