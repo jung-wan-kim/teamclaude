@@ -1162,10 +1162,15 @@ export class AccountManager {
     // being parked again — which defeats the point of re-login being the
     // recovery path. Reset it, and clear any cooldown the run had imposed.
     delete account._403Strikes;
-    if (account.status === 'throttled' && account.rateLimitedUntil) {
+    // Lift ONLY a cooldown that the 403 path imposed. A quota throttle from the
+    // 429 path describes upstream's rate limit, not these credentials — clearing
+    // it would route traffic before retry-after and invite a 429 storm.
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && account.rateLimitedUntil === account._403CooldownUntil) {
       account.status = 'active';
       account.rateLimitedUntil = null;
     }
+    delete account._403CooldownUntil;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).

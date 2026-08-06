@@ -203,12 +203,31 @@ test('re-login clears the strike run — a fresh account is not one 403 from a p
   acct._403Strikes = 4;
   acct.status = 'throttled';
   acct.rateLimitedUntil = Date.now() + 300_000;
+  acct._403CooldownUntil = acct.rateLimitedUntil;   // this cooldown came from a 403
 
   am.updateAccountTokens(0, { accessToken: 'new', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
 
   assert.ok(!acct._403Strikes, 'the run from the old credentials is cleared');
   assert.equal(acct.status, 'active', 'and the cooldown that run imposed is lifted');
   assert.equal(am._isAvailable(acct), true, 'so the repaired account is immediately usable');
+});
+
+test('re-login does NOT lift a genuine quota throttle', async () => {
+  // markRateLimited is shared with the 429 path. A quota throttle describes
+  // upstream's rate limit, not the credentials — releasing it on re-login would
+  // route traffic before retry-after and invite a 429 storm.
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'old', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const acct = am.accounts[0];
+  am.markRateLimited(0, 300);                       // 429 quota throttle, no 403 marker
+  const until = acct.rateLimitedUntil;
+
+  am.updateAccountTokens(0, { accessToken: 'new', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+
+  assert.equal(acct.status, 'throttled', 'the quota throttle survives a credential change');
+  assert.equal(acct.rateLimitedUntil, until, 'and its deadline is untouched');
+  assert.equal(am._isAvailable(acct), false, 'so the account stays out until retry-after');
 });
 
 test('a sustained run of 403s does eventually park — that is what re-login is for', async () => {

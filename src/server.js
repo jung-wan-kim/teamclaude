@@ -883,6 +883,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       } else {
         const cool = Math.min(F403_MAX_S, F403_BASE_S * 2 ** (strikes - 1));
         accountManager.markRateLimited(account, cool);
+        // Remember that THIS cooldown came from a 403, so re-login can lift it
+        // without also releasing a genuine quota throttle set by the 429 path.
+        account._403CooldownUntil = account.rateLimitedUntil;
         steppedAside = true;
         console.log(`[TeamClaude] 403 on "${account.name}" ×${strikes} — cooling down ${cool}s (auto-recovers)`);
       }
