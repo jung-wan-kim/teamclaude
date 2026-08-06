@@ -899,7 +899,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // back, so a retry buys nothing and costs a second upstream 403 — a
       // duplicate delivery of a possibly non-idempotent body, and double load
       // on an upstream that is already refusing.
-      if (steppedAside && retryCount < maxRetries) {
+      // Two different questions, deliberately not the same test:
+      //   canPark  — "is the fleet still non-empty without this account?"     → a
+      //              capped-but-healthy account counts, since its slot frees up.
+      //   retry    — "can the next attempt actually ACQUIRE an account now?"  → a
+      //              capped one does not count. If the overflow queue can't admit
+      //              (timeout disabled or already elapsed) the recursion ends in a
+      //              synthetic 429, which would replace the real 403 we are
+      //              holding with a less truthful answer. Better to hand the
+      //              client the refusal we actually have.
+      if (steppedAside && retryCount < maxRetries && accountManager.anyUsable()) {
         releaseHeld(); // this account left rotation; fail over to another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }

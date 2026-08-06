@@ -230,6 +230,45 @@ test('re-login does NOT lift a genuine quota throttle', async () => {
   assert.equal(am._isAvailable(acct), false, 'so the account stays out until retry-after');
 });
 
+test('when the only alternative is capped, the client gets the real 403, not a synthetic 429', async () => {
+  // "Is the fleet non-empty?" and "can the retry acquire an account right now?"
+  // are different questions. A capped-but-healthy account answers the first
+  // (its slot frees up, so stepping the refused account aside is safe) but not
+  // the second — if the overflow queue cannot admit, the recursion ends in a
+  // synthetic 429 that replaces the truthful 403 we are already holding.
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  am.accounts[1].maxConcurrent = 0;   // healthy but with no slot free
+
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false, overflowQueueTimeoutMs: 1,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 403, 'the refusal we actually received is what the client sees');
+    assert.equal(am.accounts[0].status, 'throttled',
+      'the refused account still steps aside — a capped peer means the fleet is not empty');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('a sustained run of 403s does eventually park — that is what re-login is for', async () => {
   // Five consecutive refusals on the same account is no longer plausibly a
   // transient block; at that point parking (and telling the operator) is right.
