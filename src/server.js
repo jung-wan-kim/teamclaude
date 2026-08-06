@@ -882,10 +882,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         console.log(`[TeamClaude] 403 on "${account.name}" ×${strikes} — not entitled, parking (re-login to restore)`);
       } else {
         const cool = Math.min(F403_MAX_S, F403_BASE_S * 2 ** (strikes - 1));
-        accountManager.markRateLimited(account, cool);
-        // Remember that THIS cooldown came from a 403, so re-login can lift it
-        // without also releasing a genuine quota throttle set by the 429 path.
-        account._403CooldownUntil = account.rateLimitedUntil;
+        // Never SHORTEN an existing throttle. A concurrent request on this same
+        // account may already have taken a quota 429 with a much longer
+        // retry-after; overwriting that deadline with our 60s would put the
+        // account back in rotation while upstream is still refusing it on quota
+        // — a 429 storm — and would also mislabel a quota throttle as
+        // 403-derived, so re-login would wrongly lift it.
+        const coolUntil = Date.now() + cool * 1000;
+        if (!(account.rateLimitedUntil > coolUntil)) {
+          accountManager.markRateLimited(account, cool);
+          // Remember that THIS cooldown came from a 403, so re-login can lift it
+          // without also releasing a genuine quota throttle set by the 429 path.
+          account._403CooldownUntil = account.rateLimitedUntil;
+        }
         steppedAside = true;
         console.log(`[TeamClaude] 403 on "${account.name}" ×${strikes} — cooling down ${cool}s (auto-recovers)`);
       }

@@ -269,6 +269,48 @@ test('when the only alternative is capped, the client gets the real 403, not a s
   }
 });
 
+test('a 403 cooldown never shortens a longer quota throttle already in place', async () => {
+  // Concurrency: one request can take an exhaustion 429 with a long
+  // retry-after while another is still in flight on the same account. If the
+  // 403 path overwrote that deadline with its own 60s the account would return
+  // to rotation while upstream is still refusing it on quota — and the throttle
+  // would be mislabelled 403-derived, so re-login would wrongly lift it too.
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // Stand in for the concurrent quota 429 that already landed.
+    am.markRateLimited(0, 300);
+    const quotaDeadline = am.accounts[0].rateLimitedUntil;
+    am.accounts[0].status = 'active';   // let selection reach it, as an in-flight request would
+
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    }).then(r => r.text());
+
+    assert.equal(am.accounts[0].rateLimitedUntil, quotaDeadline,
+      'the longer quota deadline survives the 403 cooldown');
+    assert.notEqual(am.accounts[0]._403CooldownUntil, quotaDeadline,
+      'and it is not mislabelled as 403-derived, so re-login will not lift it');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('a sustained run of 403s does eventually park — that is what re-login is for', async () => {
   // Five consecutive refusals on the same account is no longer plausibly a
   // transient block; at that point parking (and telling the operator) is right.
