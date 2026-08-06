@@ -1157,6 +1157,15 @@ export class AccountManager {
     // cause (unlike the sweep's refresh-success, which only heals refresh-caused
     // errors) — the auth material actually changed.
     if (account.status === 'error') { account.status = 'active'; delete account._errorFromRefresh; }
+    // The 403 strike run describes the OLD credentials. Carrying it over would
+    // mean a freshly re-authenticated account sits one unrelated 403 away from
+    // being parked again — which defeats the point of re-login being the
+    // recovery path. Reset it, and clear any cooldown the run had imposed.
+    delete account._403Strikes;
+    if (account.status === 'throttled' && account.rateLimitedUntil) {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+    }
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).

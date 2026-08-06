@@ -192,6 +192,25 @@ test('a cooled-down account returns to rotation on its own, with no re-login', a
   assert.equal(hit.status, 'active', 'and restored to active without any credential change');
 });
 
+test('re-login clears the strike run — a fresh account is not one 403 from a park', async () => {
+  // The strike run describes the OLD credentials. If it survives re-login, the
+  // account the operator just repaired sits a single unrelated 403 away from
+  // being parked again, which makes re-login a non-recovery.
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'old', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const acct = am.accounts[0];
+  acct._403Strikes = 4;
+  acct.status = 'throttled';
+  acct.rateLimitedUntil = Date.now() + 300_000;
+
+  am.updateAccountTokens(0, { accessToken: 'new', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+
+  assert.ok(!acct._403Strikes, 'the run from the old credentials is cleared');
+  assert.equal(acct.status, 'active', 'and the cooldown that run imposed is lifted');
+  assert.equal(am._isAvailable(acct), true, 'so the repaired account is immediately usable');
+});
+
 test('a sustained run of 403s does eventually park — that is what re-login is for', async () => {
   // Five consecutive refusals on the same account is no longer plausibly a
   // transient block; at that point parking (and telling the operator) is right.
