@@ -206,7 +206,14 @@ export class AccountManager {
       const best = this._selectBest();
       if (best && best.index !== this.currentIndex) {
         console.log(`[TeamClaude] Leaving "${current.name}" (403-refused, was last usable) → "${best.name}"`);
-        delete current._403KeptActiveAt;
+        // Deliberately do NOT clear the marker here. Routing elsewhere is not
+        // evidence that upstream stopped refusing this account — only a non-403
+        // response from it, or new credentials, is. Clearing on handover left a
+        // window where the connection-affinity home still pointed at the account
+        // while the guard that rejects it had just been dropped, so the very
+        // next request snapped back and drew another 403. The marker retires on
+        // proof, not on avoidance; it costs nothing to keep, since a marked
+        // account is still fully eligible and simply sorts last.
         this.currentIndex = best.index;
         this.lastEvalAt = now;
         return best;
@@ -338,10 +345,15 @@ export class AccountManager {
       // available. Overwriting it then would let one blip permanently evict the
       // connection from its cache-warm account. So keep an available home (even
       // capped/excluded right now); replace it only when it's genuinely gone
-      // (removed, unavailable, or exhausted — `_isAvailable` is false).
+      // (removed, unavailable, or exhausted — `_isAvailable` is false), or when
+      // upstream is refusing it: a marked account stays `active`, so without
+      // that clause the home survives, and the connection would snap back to it
+      // the moment the marker clears — trading one 403 for another. A refusal
+      // is not the transient blip this exemption is protecting.
       if (affOk) {
         const home = this._affinity.get(affinityKey);
-        const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home);
+        const homeUsable = home && this.accounts[home.index] === home
+          && this._isAvailable(home) && !home._403KeptActiveAt;
         if (!homeUsable) this._affinity.set(affinityKey, account);
       }
       return account;

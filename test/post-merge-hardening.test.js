@@ -430,8 +430,12 @@ test('the fleet leaves a 403-refused last-usable account as soon as a peer recov
     assert.equal(next.name, 'b',
       'once a peer is usable again the fleet must leave the refusing account; '
       + 'staying on it means every request keeps drawing a 403');
-    assert.equal(am.accounts[0]._403KeptActiveAt, undefined,
-      'the marker is retired once the handover happened');
+    // The marker survives the handover on purpose: routing elsewhere is not
+    // evidence that upstream stopped refusing. Retiring it here would drop the
+    // guard while the connection-affinity home still pointed at the account, so
+    // the next request would snap right back to another 403.
+    assert.ok(am.accounts[0]._403KeptActiveAt,
+      'the marker retires on proof (a non-403 response / re-login), not on avoidance');
   } finally {
     proxy.close(); upstream.close();
   }
@@ -482,15 +486,19 @@ test('a 403-refused account loses to a healthy peer on every selection path', ()
   const acquired = am._tryAcquire(null, sock);
   assert.notEqual(acquired.name, 'a',
     'a keep-alive connection must not stay pinned to a refusing account');
+  // ...and the home must MOVE. Affinity is normally preserved through transient
+  // blips (a capped or failover-excluded home is still "usable"), but a refused
+  // account stays `active` too — so keeping it as home means the connection
+  // snaps straight back to another 403 as soon as the guard lifts.
+  assert.notEqual(am._affinity.get(sock).name, 'a',
+    'the affinity home must be re-pointed away from a refusing account, not merely skipped');
   am.releaseAccount(acquired);
 
   // ④ the round-robin tie-set must not fold the refused account back in. The
   //    sort demotes it, but if the tie predicate omits that dimension the two
   //    accounts count as tied and `tied[0]` hands the refused one straight back
   //    whenever currentIndex is the healthy peer.
-  //    (③ went through the real handover, which consumes the marker by design —
-  //    re-stamp it so this step actually exercises a refused account.)
-  a._403KeptActiveAt = now;
+  assert.ok(a._403KeptActiveAt, 'the marker survives a handover — it retires on proof, not avoidance');
   am.markRateLimited(c, 300);        // leave exactly a (marked) and b (healthy), equal quota
   am.currentIndex = b.index;
   assert.equal(am._selectBest().name, 'b',
