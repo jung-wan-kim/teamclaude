@@ -841,12 +841,22 @@ test('a late 403 from pre-re-login credentials does not re-create the strike run
 // credential-replacing site is added without the bump.
 test('every credential replacement bumps the generation', async () => {
   const src = await readFile(new URL('../src/account-manager.js', import.meta.url), 'utf8');
-  const replacements = src.match(/account\.credential = /g) || [];
-  const bumps = src.match(/account\._credGen = \(account\._credGen \|\| 0\) \+ 1/g) || [];
+  const lines = src.split('\n');
+  // Dot and bracket form, whitespace-insensitive — a global count would pass if
+  // a bump were moved to unrelated code, so each assignment is paired with a
+  // bump that FOLLOWS it within the same block.
+  const assigns = [];
+  const bumpAt = [];
+  lines.forEach((l, i) => {
+    if (/account\s*(\.\s*credential|\[\s*['"`]credential['"`]\s*\])\s*=[^=]/.test(l)) assigns.push(i);
+    if (/account\s*(\.\s*_credGen|\[\s*['"`]_credGen['"`]\s*\])\s*=[^=]/.test(l)) bumpAt.push(i);
+  });
 
-  assert.ok(replacements.length >= 2,
-    `expected the refresh and re-login sites, found ${replacements.length}`);
-  assert.equal(bumps.length, replacements.length,
-    `every site replacing account.credential must bump _credGen — `
-    + `${replacements.length} replacements vs ${bumps.length} bumps`);
+  assert.ok(assigns.length >= 2,
+    `expected the refresh and re-login sites, found ${assigns.length}`);
+  const WINDOW = 25;   // same block, allowing for the comment that explains it
+  const unpaired = assigns.filter(i => !bumpAt.some(b => b > i && b - i <= WINDOW));
+  assert.deepEqual(unpaired.map(i => i + 1), [],
+    'every site replacing account.credential must bump _credGen right after it — '
+    + `unpaired at line(s) ${unpaired.map(i => i + 1).join(', ') || 'none'}`);
 });
