@@ -1237,6 +1237,11 @@ export class AccountManager {
     // orders concurrent responses against it.
     delete account._403KeptActiveAt;
     delete account._403LastAt;
+    // Generation bump: requests already in flight went out with the OLD
+    // credentials, so a 403 of theirs landing after this point must not
+    // re-create the run we just wiped (it would park a freshly
+    // re-authenticated account). forwardRequest captures this at dispatch.
+    account._credGen = (account._credGen || 0) + 1;
     // Lift ONLY a cooldown that the 403 path imposed. A quota throttle from the
     // 429 path describes upstream's rate limit, not these credentials — clearing
     // it would route traffic before retry-after and invite a 429 storm.

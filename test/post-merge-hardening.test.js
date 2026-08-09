@@ -721,3 +721,106 @@ test('a slow 2xx does not erase a 403 that landed after it was dispatched', asyn
     proxy.close(); upstream.close();
   }
 });
+
+// A strike is meant to count a consecutive refusal ROUND. Counting responses
+// instead lets one transient upstream blip park an account: N requests already
+// in flight all come back 403 and, with a healthy peer available, every one of
+// them passes canPark.
+test('a concurrent burst of 403s counts as one round, not N strikes', async () => {
+  const hour = 3600_000;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    if ((req.headers.authorization || '').includes('ta')) {
+      await new Promise(r => setTimeout(r, 120));   // hold them all in flight together
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'blip' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + hour },
+    { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'r', expiresAt: Date.now() + hour },
+  ], 0.98, 0, 5);                                    // 5 concurrent slots per account
+  const reset = String(Math.floor((Date.now() + 2 * hour) / 1000));
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': reset });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.2', 'anthropic-ratelimit-unified-5h-reset': reset });
+
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    sessionAffinity: false,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const send = () => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    }).then(r => r.text().then(() => r.status));
+
+    await Promise.all([send(), send(), send(), send(), send()]);
+
+    const a = am.accounts[0];
+    assert.notEqual(a.status, 'error',
+      'one transient burst must not permanently park an account');
+    assert.ok((a._403Strikes || 0) <= 1,
+      `concurrent refusals are one round, got ${a._403Strikes} strikes`);
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});
+
+// updateAccountTokens wipes the strike run because it describes the OLD
+// credentials. A request that left before the re-login can land after it — its
+// verdict is about credentials the account no longer holds, so it must not
+// re-create the run and park a freshly re-authenticated account.
+test('a late 403 from pre-re-login credentials does not re-create the strike run', async () => {
+  const hour = 3600_000;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    await new Promise(r => setTimeout(r, 200));
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'old creds' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + hour },
+  ], 0.98, 0);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const inFlight = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    }).then(r => r.text().then(() => r.status));
+
+    await new Promise(r => setTimeout(r, 60));       // request is out with the old token
+    am.accounts[0]._403Strikes = 4;                  // pretend a run had built up
+    am.updateAccountTokens(0, {                      // re-login wipes it and bumps the generation
+      accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + hour,
+    });
+
+    await inFlight;
+
+    const a = am.accounts[0];
+    assert.equal(a._403Strikes || 0, 0,
+      'a verdict on discarded credentials must not rebuild the run');
+    assert.notEqual(a.status, 'error',
+      'and must not park the account that was just re-authenticated');
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});
