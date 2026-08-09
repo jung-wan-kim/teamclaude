@@ -13,3 +13,4 @@ config.json
 # Claude Code local permissions — never commit (public repo)
 .claude/settings.local.json
 .claude/worktrees/
+.codex-review-deferred
