@@ -867,6 +867,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-7d_'))) {
       ctx.sawModelWeekly = true;
     }
+    // Deliberately NOT gated on `sentCredGen`, unlike the 403 state below.
+    // Quota is a property of the ACCOUNT, not of the bearer token: a refresh or
+    // a re-login to the same identity does not reset the 5h/7d windows, so
+    // headers from a request that went out moments earlier still describe this
+    // account correctly — every quota reading is a moment old by construction.
+    // Discarding them on a generation change would throw away valid data and
+    // blind the fleet right after a re-login. The consequences also differ in
+    // kind: a throttle here is time-bounded and self-expiring, whereas a 403
+    // park is one-way and operator-visible, which is what earns that path the
+    // stricter evidence rule (see the strike accounting in the 403 branch).
     accountManager.updateQuota(account, rateLimitHeaders);
 
     // 403 = the account is authenticated but not ENTITLED to serve this request
