@@ -171,6 +171,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (!force && !accountManager.warmupCandidates().includes(account)) return;
     account._warming = true;
     const probe = probeSignal();
+    // Stamped BEFORE the request goes out so the 2xx below can be compared
+    // against anything that happened while it was in flight (see the marker
+    // clear) — evidence is only newer than what predates its own start.
+    const probeStartedAt = Date.now();
     try {
       const headers = { 'content-type': 'application/json', 'anthropic-version': probeTemplate.version };
       if (probeTemplate.beta) headers['anthropic-beta'] = probeTemplate.beta;
@@ -203,8 +207,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // never reach a park and would oscillate: 403 → mark → probe → clear →
       // 403, indefinitely. The park is one-way and operator-visible, so it stays
       // driven by client traffic (cleared at the pass-through point below).
+      // The `< probeStartedAt` test is the ordering guard: a client request can
+      // 403 and stamp the marker WHILE this probe is in flight, and that marker
+      // describes a refusal newer than anything this response can attest to.
+      // Clearing it would drop the guard on a genuinely refusing account and —
+      // at reevalIntervalMs <= 0, where nothing else re-picks — leave the fleet
+      // pinned to it. So only a marker that predates this probe's own start is
+      // retired by it. `Date.now()` is millisecond-granular, so a stamp landing
+      // in the probe's own start millisecond is ambiguous; `<` resolves that the
+      // safe way — keep the marker, and let real traffic retire it.
       if (res.ok && accountManager.accounts[account.index] === account
-          && account._403KeptActiveAt) {
+          && account._403KeptActiveAt && account._403KeptActiveAt < probeStartedAt) {
         delete account._403KeptActiveAt;
       }
       // Learn ONLY from a response upstream accepted (2xx) or an *account-level*

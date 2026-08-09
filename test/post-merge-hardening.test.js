@@ -589,6 +589,10 @@ test('a successful warm-up probe retires the 403 marker and the strike run', asy
     const a = am.accounts[0];
     a._403KeptActiveAt = Date.now();
     a._403Strikes = 4;                // one unrelated 403 away from a permanent park
+    // Date.now() is millisecond-granular and the ordering guard resolves an
+    // ambiguous same-millisecond stamp conservatively (keep the marker), so put
+    // the probe unambiguously after the refusal — as it is in reality.
+    await new Promise(r => setTimeout(r, 5));
 
     const r = await proxy.refreshQuotaAll();
     assert.ok(r.measured >= 1, `the forced re-measure must actually probe, got ${JSON.stringify(r)}`);
@@ -601,6 +605,60 @@ test('a successful warm-up probe retires the 403 marker and the strike run', asy
     // and operator-visible, so it stays driven by real client traffic.
     assert.equal(a._403Strikes, 4,
       'a synthetic probe must not erase a real run of refusals');
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});
+
+// A probe can only attest to what predates its own start. If a client request
+// 403s WHILE the probe is in flight, the marker it stamps is newer evidence than
+// the probe's 2xx — clearing it would drop the guard on an account that is
+// refusing right now, and at reevalIntervalMs 0 nothing else would re-pick.
+test('an in-flight probe does not clear a marker stamped after it started', async () => {
+  const hour = 3600_000;
+  let slow = false;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    if (slow) await new Promise(r => setTimeout(r, 150));   // probe stays in flight
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + hour) / 1000)),
+      'anthropic-ratelimit-unified-7d-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * hour) / 1000)),
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + hour },
+  ], 0.98, 0);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    }).then(r => r.text());
+    await new Promise(r => setTimeout(r, 80));
+
+    const a = am.accounts[0];
+    slow = true;
+    const inFlight = proxy.refreshQuotaAll();          // probe departs now
+    await new Promise(r => setTimeout(r, 50));         // ...and is still out there
+    const stamped = Date.now();
+    a._403KeptActiveAt = stamped;                      // client 403 lands mid-probe
+    await inFlight;
+
+    assert.equal(a._403KeptActiveAt, stamped,
+      'the probe attests only to what predates it — a newer refusal must survive');
   } finally {
     proxy.close(); upstream.close();
   }
