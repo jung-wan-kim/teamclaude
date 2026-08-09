@@ -870,6 +870,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       let steppedAside = false;    // did this account actually leave rotation?
       if (!canPark) {
+        // Staying active keeps this account the sticky primary, and selection
+        // has no way back off a *usable* current account: the "current
+        // unavailable" branch can't fire (we deliberately left it available),
+        // and the periodic re-pick is disabled entirely at reevalIntervalMs <= 0.
+        // Without a marker the fleet would stay pinned here forever, sending
+        // every request to an account upstream is refusing — even after a peer
+        // recovers. Mark it so getActiveAccount hands over the moment anyone
+        // else is usable; the safety valve (never leave the fleet empty) is
+        // preserved because the handover only fires when a peer actually exists.
+        account._403KeptActiveAt = Date.now();
         console.log(`[TeamClaude] 403 on "${account.name}" — last usable account, keeping it active`);
       } else if (strikes >= F403_PARK_AFTER) {
         account.status = 'error';
@@ -917,7 +927,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       //              synthetic 429, which would replace the real 403 we are
       //              holding with a less truthful answer. Better to hand the
       //              client the refusal we actually have.
-      if (steppedAside && retryCount < maxRetries && accountManager.anyUsable()) {
+      // Ask about the SAME candidate set the recursion will actually select
+      // from: it excludes `ctx.tried429 ∪ ctx.tried5xx`. An unqualified
+      // anyUsable() also counts accounts this request already burned — a prior
+      // non-exhaustion 429 leaves its account `active` (excluded per-request
+      // only, never throttled), so the gate would pass, acquisition would find
+      // nothing, and the `!account` branch would answer 429 — precisely the
+      // truthful-403 → synthetic-429 swap this block exists to prevent.
+      // `account` itself is already unavailable here (it stepped aside); listing
+      // it is defence in depth for any future step-aside that leaves it usable.
+      const retryExclude = new Set([account, ...ctx.tried429, ...ctx.tried5xx]);
+      if (steppedAside && retryCount < maxRetries && accountManager.anyUsable(retryExclude)) {
         releaseHeld(); // this account left rotation; fail over to another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
@@ -1165,6 +1185,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // not a standing entitlement problem — clear the strike run that would
     // otherwise creep toward a permanent park across unrelated incidents.
     if (account._403Strikes) account._403Strikes = 0;
+    // Same evidence retires the "kept active only because it was last usable"
+    // marker: upstream just served this account, so there is nothing to hand off.
+    if (account._403KeptActiveAt) delete account._403KeptActiveAt;
 
     // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};

@@ -322,3 +322,117 @@ test('a sustained run of 403s does eventually park — that is what re-login is 
     'upstream rejected the ACCOUNT — the token sweep must not revive it');
   assert.ok(parked._403Strikes >= 5, `park only after the run, got ${parked._403Strikes}`);
 });
+
+// ── the 403 retry gate must ask about the set the recursion will SELECT from ──
+//
+// The gate decides "is there somewhere to fail over to". The recursion then
+// selects with `ctx.tried429 ∪ ctx.tried5xx` excluded. An unqualified
+// anyUsable() also counts an account this request already burned: a
+// non-exhaustion 429 leaves its account `active` (per-request exclusion only,
+// never throttled). The gate passes, acquisition finds nothing, and the client
+// gets a synthetic 429 — exactly the truthful-403 → 429 swap the block exists
+// to prevent.
+
+test('a 403 is surfaced, not downgraded to 429, when the only peer was already tried', async () => {
+  let n = 0;
+  const upstream = http.createServer((_req, res) => {
+    n++;
+    if (n === 1) {
+      // Plain request-rate 429: no `unified-status: rejected`, no utilization
+      // headers → NOT quota exhaustion, so the account is excluded for this
+      // request only and stays `active` for everyone else.
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }));
+      return;
+    }
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'not entitled' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    overflowQueueTimeoutMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const status = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    }).then(r => r.text().then(() => r.status));
+
+    assert.equal(status, 403,
+      'the refusal we actually hold must reach the client, not a synthetic 429 '
+      + 'produced by a retry that had nowhere left to go');
+    assert.equal(n, 2, `one 429 failover then one 403 — no third upstream hit, got ${n}`);
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});
+
+// ── keeping the last usable account must not pin the fleet to it forever ──────
+//
+// When the last usable account 403s we keep it active (parking it would leave
+// the proxy with nothing to route to). But then no selection branch can move
+// off it — it is available by construction and measured — so at
+// `reevalIntervalMs: 0` every later request keeps hitting an account upstream
+// is refusing, even after a peer's throttle expires.
+
+test('the fleet leaves a 403-refused last-usable account as soon as a peer recovers', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'not entitled' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0); // reevalIntervalMs: 0 — no timer-driven re-pick, the sticky lock case
+  const reset = String(Math.floor((Date.now() + 2 * 60 * 60 * 1000) / 1000));
+  // Measured, so cold-start warm-up round-robin doesn't drive selection.
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': reset });
+  am.updateQuota(1, { 'anthropic-ratelimit-unified-5h-utilization': '0.1', 'anthropic-ratelimit-unified-5h-reset': reset });
+  am.markRateLimited(am.accounts[1], 300); // b is out → a is the LAST usable one
+
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    overflowQueueTimeoutMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const status = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    }).then(r => r.text().then(() => r.status));
+
+    assert.equal(status, 403, 'the refusal is surfaced');
+    assert.equal(am.accounts[0].status, 'active', 'the last usable account stays in rotation');
+    assert.ok(am.accounts[0]._403KeptActiveAt,
+      'it must be marked as "kept only because there was nowhere else"');
+
+    // b's throttle lapses — nothing else changes, and no timer can fire.
+    am.accounts[1].rateLimitedUntil = Date.now() - 1000;
+
+    const next = am.getActiveAccount();
+    assert.equal(next.name, 'b',
+      'once a peer is usable again the fleet must leave the refusing account; '
+      + 'staying on it means every request keeps drawing a 403');
+    assert.equal(am.accounts[0]._403KeptActiveAt, undefined,
+      'the marker is retired once the handover happened');
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});

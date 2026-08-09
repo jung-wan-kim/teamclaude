@@ -193,6 +193,26 @@ export class AccountManager {
       }
     }
 
+    // This account is current only because it was the LAST usable one when
+    // upstream refused it with a 403 — server.js keeps it active rather than
+    // leave the fleet with nothing to route to. None of the branches above can
+    // move off it: it is available by construction and measured, so with
+    // `reevalIntervalMs <= 0` it would stay pinned forever and every request
+    // would keep hitting an account upstream is refusing, long after a peer
+    // recovered. Exclude it from the pick so ANY other usable account wins —
+    // _selectBest(exclude) returns null when there genuinely is nobody else, in
+    // which case we stay put and the safety valve still holds.
+    if (current._403KeptActiveAt) {
+      const best = this._selectBest(new Set([current]));
+      if (best) {
+        console.log(`[TeamClaude] Leaving "${current.name}" (403-refused, was last usable) → "${best.name}"`);
+        delete current._403KeptActiveAt;
+        this.currentIndex = best.index;
+        this.lastEvalAt = now;
+        return best;
+      }
+    }
+
     return current;
   }
 
@@ -1162,6 +1182,9 @@ export class AccountManager {
     // being parked again — which defeats the point of re-login being the
     // recovery path. Reset it, and clear any cooldown the run had imposed.
     delete account._403Strikes;
+    // Same reasoning for the "kept active because it was last usable" marker:
+    // it describes a refusal of the OLD credentials.
+    delete account._403KeptActiveAt;
     // Lift ONLY a cooldown that the 403 path imposed. A quota throttle from the
     // 429 path describes upstream's rate limit, not these credentials — clearing
     // it would route traffic before retry-after and invite a 429 storm.
