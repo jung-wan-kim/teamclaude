@@ -593,9 +593,14 @@ test('a successful warm-up probe retires the 403 marker and the strike run', asy
     const r = await proxy.refreshQuotaAll();
     assert.ok(r.measured >= 1, `the forced re-measure must actually probe, got ${JSON.stringify(r)}`);
     assert.equal(a._403KeptActiveAt, undefined,
-      'a 2xx probe is proof the account serves — the marker must retire');
-    assert.equal(a._403Strikes, 0,
-      'the strike run resets too, or one unrelated 403 parks a working account');
+      'a 2xx probe is proof the account serves — the routing marker must retire');
+    // But NOT the strike run: a probe replays one cached template, so it only
+    // proves that shape works. Letting it reset the run would mean an account
+    // refused for a model its plan lacks could never reach a park — it would
+    // oscillate 403 → mark → probe → clear → 403 forever. The park is one-way
+    // and operator-visible, so it stays driven by real client traffic.
+    assert.equal(a._403Strikes, 4,
+      'a synthetic probe must not erase a real run of refusals');
   } finally {
     proxy.close(); upstream.close();
   }

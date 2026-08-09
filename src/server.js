@@ -193,9 +193,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // warm-up and affinity, and one unrelated 403 away from a park. Kept
       // outside the quota-folding block below so a header-less 2xx still counts
       // as proof. (Only 2xx: a 429/5xx says nothing about entitlement.)
-      if (res.ok && accountManager.accounts[account.index] === account) {
-        if (account._403Strikes) account._403Strikes = 0;
-        if (account._403KeptActiveAt) delete account._403KeptActiveAt;
+      // Deliberately asymmetric, because a probe is weaker evidence than real
+      // traffic: it replays ONE cached template, so a 2xx only proves the
+      // account serves *that* model/feature shape. It therefore retires the
+      // routing marker — cheap and self-correcting, since routing back and
+      // getting refused again just re-marks it — but does NOT reset the strike
+      // run. Resetting that would let a probe on an entitled shape erase a real
+      // run of refusals on a shape the plan doesn't cover, so the account could
+      // never reach a park and would oscillate: 403 → mark → probe → clear →
+      // 403, indefinitely. The park is one-way and operator-visible, so it stays
+      // driven by client traffic (cleared at the pass-through point below).
+      if (res.ok && accountManager.accounts[account.index] === account
+          && account._403KeptActiveAt) {
+        delete account._403KeptActiveAt;
       }
       // Learn ONLY from a response upstream accepted (2xx) or an *account-level*
       // quota 429 — one whose `unified-status` is `rejected` (the account is
