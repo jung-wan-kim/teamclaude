@@ -860,10 +860,22 @@ test('every credential replacement bumps the generation', async () => {
   // the NEXT assignment, and no bump is claimed twice. A plain "is there a bump
   // within N lines" would let one bump cover two nearby assignments, so dropping
   // the first site's bump would still pass.
+  // ...and in the SAME block. Indentation stands in for control flow here: a
+  // bump nested deeper is inside a conditional the assignment is not guarded by
+  // (`if (false) { bump }` would otherwise pass), and any intervening line
+  // indented LESS means the assignment's block already closed, so a bump after
+  // it is in a sibling branch. This is a lexical approximation and is stated as
+  // one — the project forbids dependencies, so there is no parser available for
+  // real control-flow analysis. It holds for this codebase's consistent style;
+  // a same-indent bump made unreachable some other way would still pass.
+  const indentOf = i => lines[i].match(/^[ \t]*/)[0];
   const claimed = new Set();
   const unpaired = assigns.filter((at, k) => {
-    const next = assigns[k + 1] ?? Infinity;
-    const b = bumpAt.find(x => x > at && x < next && !claimed.has(x));
+    const next = assigns[k + 1] ?? lines.length;
+    const want = indentOf(at);
+    const b = bumpAt.find(x => x > at && x < next && !claimed.has(x)
+      && indentOf(x) === want
+      && !lines.slice(at + 1, x).some(l => l.trim() && l.match(/^[ \t]*/)[0].length < want.length));
     if (b === undefined) return true;
     claimed.add(b);
     return false;
