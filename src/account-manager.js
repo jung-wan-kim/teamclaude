@@ -503,12 +503,22 @@ export class AccountManager {
     // sharing one priority) are load-balanced round-robin instead of always
     // pinning to the lowest index, so a startup burst can't pile onto one account
     // before quotas are known.
+    // 🚨 The tie predicate must test the SAME key the sort ranked on, every
+    // component of it. Any dimension left out here is silently undone: accounts
+    // that the sort separated get folded back into one tie-set and the
+    // round-robin can hand back the very account the sort demoted. That is
+    // exactly what happened when `_403KeptActiveAt` was added to the sort but
+    // not here — with a marked `a`, a healthy `b` of equal quota/priority and
+    // `currentIndex === b`, `tied.find(index > currentIndex)` misses and
+    // `tied[0]` returned the refused `a`.
+    const f0 = eligible[0]._403KeptActiveAt ? 1 : 0;
     const p0 = this._priority(eligible[0]);
     const w0 = this._weeklyResetTime(eligible[0]);
     const r0 = this._sessionResetTime(eligible[0]);
     const u0 = this._sessionUtilization(eligible[0]);
     const tied = eligible
-      .filter(a => this._priority(a) === p0
+      .filter(a => (a._403KeptActiveAt ? 1 : 0) === f0
+        && this._priority(a) === p0
         && this._weeklyResetTime(a) === w0
         && this._sessionResetTime(a) === r0
         && this._sessionUtilization(a) === u0)

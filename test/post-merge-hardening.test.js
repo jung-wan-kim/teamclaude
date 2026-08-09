@@ -484,9 +484,20 @@ test('a 403-refused account loses to a healthy peer on every selection path', ()
     'a keep-alive connection must not stay pinned to a refusing account');
   am.releaseAccount(acquired);
 
-  // ④ safety valve intact: when the refused account is the ONLY eligible one it still wins.
+  // ④ the round-robin tie-set must not fold the refused account back in. The
+  //    sort demotes it, but if the tie predicate omits that dimension the two
+  //    accounts count as tied and `tied[0]` hands the refused one straight back
+  //    whenever currentIndex is the healthy peer.
+  //    (③ went through the real handover, which consumes the marker by design —
+  //    re-stamp it so this step actually exercises a refused account.)
+  a._403KeptActiveAt = now;
+  am.markRateLimited(c, 300);        // leave exactly a (marked) and b (healthy), equal quota
+  am.currentIndex = b.index;
+  assert.equal(am._selectBest().name, 'b',
+    'the tie-breaker must respect the refusal — its equivalence key has to match the sort key');
+
+  // ⑤ safety valve intact: when the refused account is the ONLY eligible one it still wins.
   am.markRateLimited(b, 300);
-  am.markRateLimited(c, 300);
   assert.equal(am._selectBest().name, 'a',
     'the penalty must never empty the fleet — a refusal is not a removal');
 });
