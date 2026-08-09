@@ -654,11 +654,69 @@ test('an in-flight probe does not clear a marker stamped after it started', asyn
     const inFlight = proxy.refreshQuotaAll();          // probe departs now
     await new Promise(r => setTimeout(r, 50));         // ...and is still out there
     const stamped = Date.now();
-    a._403KeptActiveAt = stamped;                      // client 403 lands mid-probe
+    a._403LastAt = stamped;                            // client 403 lands mid-probe
+    a._403KeptActiveAt = stamped;                      // (both fields, as the 403 branch sets them)
     await inFlight;
 
     assert.equal(a._403KeptActiveAt, stamped,
       'the probe attests only to what predates it — a newer refusal must survive');
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});
+
+// The same ordering hazard on the client path: requests run concurrently on one
+// account, so a later request can 403 while an earlier one is still in flight.
+// That earlier 2xx cannot attest to anything after its own dispatch.
+test('a slow 2xx does not erase a 403 that landed after it was dispatched', async () => {
+  let n = 0;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    n++;
+    if (n === 2) {                                  // the long-running request
+      await new Promise(r => setTimeout(r, 200));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+    if (n >= 3) {                                   // the refusal, lands first
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'not entitled' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'only', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  const send = () => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+  }).then(r => r.text().then(() => r.status));
+
+  try {
+    await send();                                   // n=1, warms the path
+    const slow = send();                            // n=2, 2xx held for 200ms
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(await send(), 403, 'n=3 refusal returns while the slow one is still out');
+    const a = am.accounts[0];
+    assert.ok(a._403KeptActiveAt, 'the refusal marks the account (sole account → kept active)');
+    const stamped = a._403KeptActiveAt;
+
+    assert.equal(await slow, 200, 'the earlier request still completes normally');
+    assert.equal(a._403KeptActiveAt, stamped,
+      'a response cannot retire a refusal that happened after it was dispatched');
+    assert.equal(a._403Strikes, 1, 'nor reset the strike run that refusal started');
   } finally {
     proxy.close(); upstream.close();
   }

@@ -217,7 +217,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // in the probe's own start millisecond is ambiguous; `<` resolves that the
       // safe way — keep the marker, and let real traffic retire it.
       if (res.ok && accountManager.accounts[account.index] === account
-          && account._403KeptActiveAt && account._403KeptActiveAt < probeStartedAt) {
+          && account._403KeptActiveAt && !(account._403LastAt >= probeStartedAt)) {
         delete account._403KeptActiveAt;
       }
       // Learn ONLY from a response upstream accepted (2xx) or an *account-level*
@@ -829,6 +829,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
+  // Stamped before this request leaves, so its response can be ordered against
+  // any 403 that lands on the same account while it is in flight — a response
+  // attests only to what predates its own dispatch. See the pass-through clear.
+  const sentAt = Date.now();
+
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method,
@@ -902,6 +907,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const F403_BASE_S = 60;      // first cooldown
       const F403_MAX_S = 300;      // matches the 429 throttle ceiling
       const strikes = (account._403Strikes = (account._403Strikes || 0) + 1);
+      // When the refusal happened, so a concurrent request or probe that left
+      // BEFORE it cannot retire the state it is about to set (see the
+      // pass-through clear and warmupAccount).
+      account._403LastAt = Date.now();
 
       let steppedAside = false;    // did this account actually leave rotation?
       if (!canPark) {
@@ -1218,11 +1227,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     // This account answered without a 403, so whatever refused it earlier was
     // not a standing entitlement problem — clear the strike run that would
-    // otherwise creep toward a permanent park across unrelated incidents.
-    if (account._403Strikes) account._403Strikes = 0;
-    // Same evidence retires the "kept active only because it was last usable"
-    // marker: upstream just served this account, so there is nothing to hand off.
-    if (account._403KeptActiveAt) delete account._403KeptActiveAt;
+    // otherwise creep toward a permanent park across unrelated incidents, and
+    // the "kept active only because it was last usable" marker with it.
+    //
+    // But only when the refusal predates THIS request's dispatch. Requests run
+    // concurrently on one account: a later request can 403 and stamp the state
+    // while an earlier one is still in flight, and that earlier response cannot
+    // attest to anything that happened after it left. Clearing then would erase
+    // a live refusal — at reevalIntervalMs <= 0 nothing else re-picks, so the
+    // fleet would stay pinned to an account upstream is refusing. Ambiguity
+    // inside the dispatch millisecond resolves the safe way (keep the state).
+    if (!(account._403LastAt >= sentAt)) {
+      if (account._403Strikes) account._403Strikes = 0;
+      if (account._403KeptActiveAt) delete account._403KeptActiveAt;
+    }
 
     // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};

@@ -1233,8 +1233,10 @@ export class AccountManager {
     // recovery path. Reset it, and clear any cooldown the run had imposed.
     delete account._403Strikes;
     // Same reasoning for the "kept active because it was last usable" marker:
-    // it describes a refusal of the OLD credentials.
+    // it describes a refusal of the OLD credentials, as does the timestamp that
+    // orders concurrent responses against it.
     delete account._403KeptActiveAt;
+    delete account._403LastAt;
     // Lift ONLY a cooldown that the 403 path imposed. A quota throttle from the
     // 429 path describes upstream's rate limit, not these credentials — clearing
     // it would route traffic before retry-after and invite a 429 storm.
