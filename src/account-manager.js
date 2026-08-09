@@ -687,6 +687,14 @@ export class AccountManager {
   _isWarmupTarget(account) {
     return this._isAvailable(account)
       && !this._isMeasured(account)
+      // An account upstream is refusing (403) is not a useful warm-up target:
+      // a 403 carries no rate-limit headers, so it stays unmeasured and the
+      // warm-up round-robin — which runs BEFORE the `_403KeptActiveAt` handover
+      // in getActiveAccount — would keep routing to it, drawing duplicate 403s
+      // until maxWarmupTries runs out. Skipping it here lets selection fall
+      // through to the handover. When it is the only account nothing else
+      // becomes a target either, so the safety valve is unaffected.
+      && !account._403KeptActiveAt
       && (account._warmupTries || 0) < this.maxWarmupTries;
   }
 
@@ -1361,6 +1369,12 @@ export class AccountManager {
    * when they rank equal (a tie).
    */
   _strictlyPrefer(a, b) {
+    // Same key, same order as `_selectBest`'s comparator — including the
+    // upstream-refusal demotion. If this drifts from that sort, `_reprioritize`
+    // keeps a refused current account seated even though `_selectBest` ranks a
+    // healthy peer first, and the handover waits for some later request.
+    const fa = a._403KeptActiveAt ? 1 : 0, fb = b._403KeptActiveAt ? 1 : 0;
+    if (fa !== fb) return fa < fb;
     const pa = this._priority(a), pb = this._priority(b);
     if (pa !== pb) return pa < pb;
     const wa = this._weeklyResetTime(a), wb = this._weeklyResetTime(b);

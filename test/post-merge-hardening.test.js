@@ -496,8 +496,44 @@ test('a 403-refused account loses to a healthy peer on every selection path', ()
   assert.equal(am._selectBest().name, 'b',
     'the tie-breaker must respect the refusal — its equivalence key has to match the sort key');
 
-  // ⑤ safety valve intact: when the refused account is the ONLY eligible one it still wins.
+  // ⑤ _strictlyPrefer must carry the same key, or _reprioritize (setPriority /
+  //    setEnabled) leaves a refused account seated while _selectBest ranks a peer first.
+  assert.equal(am._strictlyPrefer(b, a), true,
+    'a healthy peer must be strictly preferred over a refused account');
+  assert.equal(am._strictlyPrefer(a, b), false,
+    'a refused account is never strictly preferred over a healthy peer');
+
+  // ⑥ safety valve intact: when the refused account is the ONLY eligible one it still wins.
   am.markRateLimited(b, 300);
   assert.equal(am._selectBest().name, 'a',
     'the penalty must never empty the fleet — a refusal is not a removal');
+});
+
+// A 403 carries no rate-limit headers, so the refused account stays unmeasured —
+// and cold-start warm-up round-robins over unmeasured accounts BEFORE the
+// handover branch runs. Without excluding it there, the fleet keeps drawing
+// duplicate 403s from it until maxWarmupTries is spent.
+test('a 403-refused account is not a cold-start warm-up target', () => {
+  const now = Date.now();
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: now + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'r', expiresAt: now + 3600_000 },
+  ], 0.98, 0);
+  const [a, b] = am.accounts;                 // both unmeasured (no updateQuota)
+
+  assert.equal(am._isWarmupTarget(a), true, 'baseline: an unmeasured account is a warm-up target');
+  a._403KeptActiveAt = now;
+  assert.equal(am._isWarmupTarget(a), false,
+    'a refused account must drop out of warm-up so selection reaches the handover');
+  assert.equal(am._isWarmupTarget(b), true, 'its healthy peer is unaffected');
+
+  // Safety valve: sole account — nothing else becomes a target either, and
+  // selection still returns it rather than leaving the fleet with nothing.
+  const solo = new AccountManager([
+    { name: 'only', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: now + 3600_000 },
+  ], 0.98, 0);
+  solo.accounts[0]._403KeptActiveAt = now;
+  assert.equal(solo._isWarmupTarget(solo.accounts[0]), false);
+  assert.equal(solo.getActiveAccount().name, 'only',
+    'a one-account fleet still routes to the refused account — a refusal is not a removal');
 });
