@@ -199,12 +199,12 @@ export class AccountManager {
     // move off it: it is available by construction and measured, so with
     // `reevalIntervalMs <= 0` it would stay pinned forever and every request
     // would keep hitting an account upstream is refusing, long after a peer
-    // recovered. Exclude it from the pick so ANY other usable account wins —
-    // _selectBest(exclude) returns null when there genuinely is nobody else, in
-    // which case we stay put and the safety valve still holds.
+    // recovered. Re-pick: `_selectBest` sorts refused accounts last, so any
+    // healthy peer wins — and when this really is the only eligible account it
+    // comes back unchanged, so the safety valve still holds.
     if (current._403KeptActiveAt) {
-      const best = this._selectBest(new Set([current]));
-      if (best) {
+      const best = this._selectBest();
+      if (best && best.index !== this.currentIndex) {
         console.log(`[TeamClaude] Leaving "${current.name}" (403-refused, was last usable) → "${best.name}"`);
         delete current._403KeptActiveAt;
         this.currentIndex = best.index;
@@ -306,7 +306,14 @@ export class AccountManager {
       // spreading to gather quota data / let tokens refresh on use). Once an
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
+      // Also refuse to pin to an account upstream is actively refusing: the
+      // affinity branch returns BEFORE selection runs, so without this a
+      // keep-alive connection would keep drawing 403s from its home long after
+      // a peer recovered — cache locality is worthless on an account that
+      // cannot answer. Falling through costs nothing when it really is the only
+      // account: normal selection hands the same one back.
       if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a)
+          && !a._403KeptActiveAt
           && this._hasCapacity(a) && !(exclude && exclude.has(a))) {
         a.inflight++;
         return a;
@@ -473,6 +480,19 @@ export class AccountManager {
     if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
 
     eligible.sort((a, b) => {
+      // An account upstream is actively refusing (403, still in rotation only
+      // because it was the last usable one — see `_403KeptActiveAt`) must lose
+      // to ANY healthy peer. This is a health signal, not a preference, so it
+      // outranks even an explicit priority: pinning is a choice among accounts
+      // that work. Putting it in the sort — rather than at one call site — is
+      // what makes it hold on every selection path (sticky re-pick, per-request
+      // failover `getActiveAccount(exclude)`, and the capped-set path in
+      // `_tryAcquire`), which a single branch in getActiveAccount did not.
+      // When the refusing account is the ONLY eligible one it still sorts first
+      // by default, so the safety valve (never empty the fleet) is preserved.
+      const ra = a._403KeptActiveAt ? 1 : 0;
+      const rb = b._403KeptActiveAt ? 1 : 0;
+      if (ra !== rb) return ra - rb;                                     // upstream-refused accounts last
       const pa = this._priority(a);
       const pb = this._priority(b);
       if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)

@@ -436,3 +436,57 @@ test('the fleet leaves a 403-refused last-usable account as soon as a peer recov
     proxy.close(); upstream.close();
   }
 });
+
+// ── the refusal must bind to SELECTION, not to one call site ──────────────────
+//
+// A first attempt put the handover in getActiveAccount's sticky-return path
+// only. Two shortcuts run before it ever executes: `getActiveAccount(exclude)`
+// early-returns `_selectBest(exclude)` for per-request failover, and
+// `_tryAcquire` returns a connection's affinity home before selection at all.
+// A keep-alive socket would then keep drawing 403s from its pinned home
+// indefinitely. The penalty therefore lives in `_selectBest`'s sort, so every
+// path inherits it.
+
+test('a 403-refused account loses to a healthy peer on every selection path', () => {
+  const now = Date.now();
+  const reset = String(Math.floor((now + 2 * 60 * 60 * 1000) / 1000));
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: now + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'r', expiresAt: now + 3600_000 },
+    { name: 'c', type: 'oauth', accessToken: 'tc', refreshToken: 'r', expiresAt: now + 3600_000 },
+  ], 0.98, 0);
+  for (let i = 0; i < 3; i++) {
+    am.updateQuota(i, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': reset,
+    });
+  }
+  const [a, b, c] = am.accounts;
+  a._403KeptActiveAt = now;      // upstream is refusing `a`, kept only as last resort
+  am.currentIndex = a.index;
+
+  // ① per-request failover — getActiveAccount(exclude) never reaches the sticky branch.
+  assert.notEqual(am.getActiveAccount(new Set([c])).name, 'a',
+    'failover selection must not hand back the account upstream is refusing');
+
+  // ② an explicit priority must not outrank a refusal: pinning is a preference
+  //    among accounts that work.
+  am.setPriority('a', 0);
+  assert.notEqual(am._selectBest().name, 'a',
+    'explicit priority cannot override an upstream refusal');
+  am.setPriority('a', null);
+
+  // ③ connection affinity — _tryAcquire returns the pinned home before selection.
+  const sock = {};
+  am._affinity.set(sock, a);
+  const acquired = am._tryAcquire(null, sock);
+  assert.notEqual(acquired.name, 'a',
+    'a keep-alive connection must not stay pinned to a refusing account');
+  am.releaseAccount(acquired);
+
+  // ④ safety valve intact: when the refused account is the ONLY eligible one it still wins.
+  am.markRateLimited(b, 300);
+  am.markRateLimited(c, 300);
+  assert.equal(am._selectBest().name, 'a',
+    'the penalty must never empty the fleet — a refusal is not a removal');
+});
