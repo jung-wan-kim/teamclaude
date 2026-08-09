@@ -540,6 +540,10 @@ export class TUI {
           amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
+          // Same bookkeeping updateAccountTokens owes: the 403 strike run and
+          // marker describe the credentials just replaced, and requests already
+          // in flight went out with them.
+          this.am.noteCredentialsReplaced(amAcct);
           if (amAcct.status === 'error') { amAcct.status = 'active'; delete amAcct._errorFromRefresh; }
         } else {
           // The matched config entry had no live AccountManager account (it was

@@ -1226,6 +1226,31 @@ export class AccountManager {
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
+  /**
+   * Bookkeeping every credential replacement owes, wherever it happens. Not all
+   * of them go through updateAccountTokens — the TUI writes a re-imported
+   * account's tokens straight onto the live object, and the config sync swaps a
+   * changed API key in place — and a site that skips this silently reintroduces
+   * the bug it exists to prevent, so it lives in one method rather than three
+   * copies.
+   *
+   * The 403 state describes the credentials that were just discarded: keeping
+   * the strike run would leave a freshly re-authenticated account one unrelated
+   * refusal from a permanent park, and keeping the marker would leave it demoted
+   * out of selection, warm-up and affinity. The generation bump covers requests
+   * already in flight — they went out with the old credentials, so a 403 of
+   * theirs landing after this point must not re-create what we just cleared
+   * (forwardRequest captures the generation at dispatch).
+   */
+  noteCredentialsReplaced(accountOrIndex) {
+    const account = this._resolve(accountOrIndex);
+    if (!account) return;
+    delete account._403Strikes;
+    delete account._403KeptActiveAt;
+    delete account._403LastAt;
+    account._credGen = (account._credGen || 0) + 1;
+  }
+
   updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
@@ -1241,17 +1266,7 @@ export class AccountManager {
     // mean a freshly re-authenticated account sits one unrelated 403 away from
     // being parked again — which defeats the point of re-login being the
     // recovery path. Reset it, and clear any cooldown the run had imposed.
-    delete account._403Strikes;
-    // Same reasoning for the "kept active because it was last usable" marker:
-    // it describes a refusal of the OLD credentials, as does the timestamp that
-    // orders concurrent responses against it.
-    delete account._403KeptActiveAt;
-    delete account._403LastAt;
-    // Generation bump: requests already in flight went out with the OLD
-    // credentials, so a 403 of theirs landing after this point must not
-    // re-create the run we just wiped (it would park a freshly
-    // re-authenticated account). forwardRequest captures this at dispatch.
-    account._credGen = (account._credGen || 0) + 1;
+    this.noteCredentialsReplaced(account);
     // Lift ONLY a cooldown that the 403 path imposed. A quota throttle from the
     // 429 path describes upstream's rate limit, not these credentials — clearing
     // it would route traffic before retry-after and invite a 429 storm.

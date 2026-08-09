@@ -1179,6 +1179,9 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
+      // Same bookkeeping updateAccountTokens owes — this is a credential
+      // replacement too, it just arrives via config sync instead of a login.
+      accountManager.noteCredentialsReplaced(mgr);
       if (mgr.status === 'error') mgr.status = 'active';
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }

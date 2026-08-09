@@ -840,47 +840,49 @@ test('a late 403 from pre-re-login credentials does not re-create the strike run
 // evidence and can park the account. This fails loudly if a third
 // credential-replacing site is added without the bump.
 test('every credential replacement bumps the generation', async () => {
-  const src = await readFile(new URL('../src/account-manager.js', import.meta.url), 'utf8');
-  const lines = src.split('\n');
-  // Dot and bracket form, whitespace-insensitive — a global count would pass if
-  // a bump were moved to unrelated code, so each assignment is paired with a
-  // bump that FOLLOWS it within the same block.
-  const assigns = [];
-  const bumpAt = [];
-  lines.forEach((l, i) => {
-    const code = l.replace(/\/\/.*$/, '');           // a bump named in a comment is not a bump
-    if (/account\s*(\.\s*credential|\[\s*['"`]credential['"`]\s*\])\s*=[^=]/.test(code)) assigns.push(i);
-    if (/account\s*(\.\s*_credGen|\[\s*['"`]_credGen['"`]\s*\])\s*=[^=]/.test(code)) bumpAt.push(i);
-  });
+  // Every source file, and any receiver name. The review found two real sites
+  // outside account-manager — `amAcct.credential` in the TUI's re-import and
+  // `mgr.credential` in the config sync — that a check scanning one file for the
+  // identifier `account` was structurally blind to.
+  const files = ['account-manager.js', 'server.js', 'tui.js', 'index.js', 'config.js', 'oauth.js'];
+  let sites = 0;
 
-  assert.ok(assigns.length >= 2,
-    `expected the refresh and re-login sites, found ${assigns.length}`);
+  for (const f of files) {
+    const lines = (await readFile(new URL(`../src/${f}`, import.meta.url), 'utf8')).split('\n');
+    const strip = l => l.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+    const indentOf = i => lines[i].match(/^[ \t]*/)[0];
 
-  // True 1:1 — each assignment claims its own bump, taken after it and before
-  // the NEXT assignment, and no bump is claimed twice. A plain "is there a bump
-  // within N lines" would let one bump cover two nearby assignments, so dropping
-  // the first site's bump would still pass.
-  // ...and in the SAME block. Indentation stands in for control flow here: a
-  // bump nested deeper is inside a conditional the assignment is not guarded by
-  // (`if (false) { bump }` would otherwise pass), and any intervening line
-  // indented LESS means the assignment's block already closed, so a bump after
-  // it is in a sibling branch. This is a lexical approximation and is stated as
-  // one — the project forbids dependencies, so there is no parser available for
-  // real control-flow analysis. It holds for this codebase's consistent style;
-  // a same-indent bump made unreachable some other way would still pass.
-  const indentOf = i => lines[i].match(/^[ \t]*/)[0];
-  const claimed = new Set();
-  const unpaired = assigns.filter((at, k) => {
-    const next = assigns[k + 1] ?? lines.length;
-    const want = indentOf(at);
-    const b = bumpAt.find(x => x > at && x < next && !claimed.has(x)
-      && indentOf(x) === want
-      && !lines.slice(at + 1, x).some(l => l.trim() && l.match(/^[ \t]*/)[0].length < want.length));
-    if (b === undefined) return true;
-    claimed.add(b);
-    return false;
-  });
-  assert.deepEqual(unpaired.map(i => i + 1), [],
-    'every site replacing account.credential must bump _credGen before the next one — '
-    + `unpaired at line(s) ${unpaired.map(i => i + 1).join(', ') || 'none'}`);
+    const assigns = [];
+    const bumps = [];
+    lines.forEach((l, i) => {
+      const code = strip(l);
+      if (/\b[\w$]+\s*(\.\s*credential|\[\s*['"`]credential['"`]\s*\])\s*=[^=]/.test(code)) assigns.push(i);
+      if (/(_credGen\s*=[^=])|noteCredentialsReplaced\s*\(/.test(code)) bumps.push(i);
+    });
+    sites += assigns.length;
+
+    // 1:1 and same-block. Each assignment claims its own bump, taken after it and
+    // before the NEXT assignment, at the same indent, with no intervening line
+    // indented less (which would mean its block already closed, putting the bump
+    // in a sibling branch). Lexical by necessity — the project forbids
+    // dependencies, so no parser is available for real control-flow analysis.
+    const claimed = new Set();
+    const unpaired = assigns.filter((at, k) => {
+      const next = assigns[k + 1] ?? lines.length;
+      const want = indentOf(at);
+      const b = bumps.find(x => x > at && x < next && !claimed.has(x)
+        && indentOf(x) === want
+        && !lines.slice(at + 1, x).some(l => l.trim() && l.match(/^[ \t]*/)[0].length < want.length));
+      if (b === undefined) return true;
+      claimed.add(b);
+      return false;
+    });
+    assert.deepEqual(unpaired.map(i => i + 1), [],
+      `${f}: every credential replacement must bump the generation in the same block `
+      + `(directly or via noteCredentialsReplaced) — unpaired at line(s) `
+      + `${unpaired.map(i => i + 1).join(', ')}`);
+  }
+
+  assert.ok(sites >= 3,
+    `expected the re-login, TUI re-import and config-sync sites, found ${sites}`);
 });
