@@ -545,3 +545,58 @@ test('a 403-refused account is not a cold-start warm-up target', () => {
   assert.equal(solo.getActiveAccount().name, 'only',
     'a one-account fleet still routes to the refused account — a refusal is not a removal');
 });
+
+// "Retires on proof" has to mean every source of proof. A forced re-measure
+// (refreshQuotaAll, the TUI's R) gets a 2xx from the account — the same evidence
+// the client response path clears on — so it must clear too, or the account
+// stays demoted out of selection/warm-up/affinity while looking healthy, one
+// unrelated 403 away from a permanent park.
+test('a successful warm-up probe retires the 403 marker and the strike run', async () => {
+  const hour = 3600_000;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + hour) / 1000)),
+      'anthropic-ratelimit-unified-7d-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * hour) / 1000)),
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + hour },
+    { name: 'b', type: 'oauth', accessToken: 'tb', refreshToken: 'r', expiresAt: Date.now() + hour },
+  ], 0.98, 0);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // One real request commits the probe template (nothing can be probed without it).
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    }).then(r => r.text());
+    await new Promise(r => setTimeout(r, 80)); // let the startup fan-out settle
+
+    const a = am.accounts[0];
+    a._403KeptActiveAt = Date.now();
+    a._403Strikes = 4;                // one unrelated 403 away from a permanent park
+
+    const r = await proxy.refreshQuotaAll();
+    assert.ok(r.measured >= 1, `the forced re-measure must actually probe, got ${JSON.stringify(r)}`);
+    assert.equal(a._403KeptActiveAt, undefined,
+      'a 2xx probe is proof the account serves — the marker must retire');
+    assert.equal(a._403Strikes, 0,
+      'the strike run resets too, or one unrelated 403 parks a working account');
+  } finally {
+    proxy.close(); upstream.close();
+  }
+});

@@ -185,6 +185,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
       }
       await res.body?.cancel();
+      // A 2xx here is exactly the proof the 403 marker retires on — upstream
+      // just served this account. Clear it, and the strike run, the same way the
+      // client response path does at its pass-through point; the two must not
+      // diverge. Without this a forced re-measure (`refreshQuotaAll`, the TUI's
+      // R) leaves the account measured but still demoted out of selection,
+      // warm-up and affinity, and one unrelated 403 away from a park. Kept
+      // outside the quota-folding block below so a header-less 2xx still counts
+      // as proof. (Only 2xx: a 429/5xx says nothing about entitlement.)
+      if (res.ok && accountManager.accounts[account.index] === account) {
+        if (account._403Strikes) account._403Strikes = 0;
+        if (account._403KeptActiveAt) delete account._403KeptActiveAt;
+      }
       // Learn ONLY from a response upstream accepted (2xx) or an *account-level*
       // quota 429 — one whose `unified-status` is `rejected` (the account is
       // genuinely over its limit). A non-exhaustion 429 (request-rate / global /
