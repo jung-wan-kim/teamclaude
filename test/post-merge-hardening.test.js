@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { readFile } from 'node:fs/promises';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { poolQuota } from '../src/tui.js';
@@ -829,21 +830,23 @@ test('a late 403 from pre-re-login credentials does not re-create the strike run
 // strike run survives it on purpose. But a park is one-way and operator-visible,
 // and a 403 can be token-scoped — so a verdict on a token that has already been
 // replaced must not be the one that crosses the threshold.
-test('a 403 on a token that was refreshed mid-flight does not push the account over the park line', () => {
-  const am = new AccountManager([
-    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-  ], 0.98, 0);
-  const a = am.accounts[0];
+// STRUCTURAL guard, not behavioural — stated plainly because the difference
+// matters. `ensureTokenFresh`'s refresh path calls the real `refreshAccessToken`
+// against Anthropic, and the suite has no seam for it (the other refresh tests
+// replace the whole method), so there is no way here to drive a live refresh and
+// watch the generation move. What IS checkable is the pairing the correctness
+// argument rests on: every site that replaces `account.credential` must bump
+// `_credGen`, or a response dispatched with the old token counts as live
+// evidence and can park the account. This fails loudly if a third
+// credential-replacing site is added without the bump.
+test('every credential replacement bumps the generation', async () => {
+  const src = await readFile(new URL('../src/account-manager.js', import.meta.url), 'utf8');
+  const replacements = src.match(/account\.credential = /g) || [];
+  const bumps = src.match(/account\._credGen = \(account\._credGen \|\| 0\) \+ 1/g) || [];
 
-  const genAtDispatch = a._credGen || 0;
-  a._403Strikes = 4;                                  // one round from a permanent park
-
-  // ensureTokenFresh's refresh path replaces the token and bumps the generation.
-  a.credential = 'refreshed-token';
-  a._credGen = (a._credGen || 0) + 1;
-
-  assert.notEqual(a._credGen, genAtDispatch,
-    'a replaced token must be a new generation, or a stale verdict counts as live');
-  // The run itself survives — a refresh proves nothing about entitlement.
-  assert.equal(a._403Strikes, 4, 'a refresh is not a re-login: the run is not wiped');
+  assert.ok(replacements.length >= 2,
+    `expected the refresh and re-login sites, found ${replacements.length}`);
+  assert.equal(bumps.length, replacements.length,
+    `every site replacing account.credential must bump _credGen — `
+    + `${replacements.length} replacements vs ${bumps.length} bumps`);
 });
