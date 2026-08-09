@@ -848,15 +848,27 @@ test('every credential replacement bumps the generation', async () => {
   const assigns = [];
   const bumpAt = [];
   lines.forEach((l, i) => {
-    if (/account\s*(\.\s*credential|\[\s*['"`]credential['"`]\s*\])\s*=[^=]/.test(l)) assigns.push(i);
-    if (/account\s*(\.\s*_credGen|\[\s*['"`]_credGen['"`]\s*\])\s*=[^=]/.test(l)) bumpAt.push(i);
+    const code = l.replace(/\/\/.*$/, '');           // a bump named in a comment is not a bump
+    if (/account\s*(\.\s*credential|\[\s*['"`]credential['"`]\s*\])\s*=[^=]/.test(code)) assigns.push(i);
+    if (/account\s*(\.\s*_credGen|\[\s*['"`]_credGen['"`]\s*\])\s*=[^=]/.test(code)) bumpAt.push(i);
   });
 
   assert.ok(assigns.length >= 2,
     `expected the refresh and re-login sites, found ${assigns.length}`);
-  const WINDOW = 25;   // same block, allowing for the comment that explains it
-  const unpaired = assigns.filter(i => !bumpAt.some(b => b > i && b - i <= WINDOW));
+
+  // True 1:1 — each assignment claims its own bump, taken after it and before
+  // the NEXT assignment, and no bump is claimed twice. A plain "is there a bump
+  // within N lines" would let one bump cover two nearby assignments, so dropping
+  // the first site's bump would still pass.
+  const claimed = new Set();
+  const unpaired = assigns.filter((at, k) => {
+    const next = assigns[k + 1] ?? Infinity;
+    const b = bumpAt.find(x => x > at && x < next && !claimed.has(x));
+    if (b === undefined) return true;
+    claimed.add(b);
+    return false;
+  });
   assert.deepEqual(unpaired.map(i => i + 1), [],
-    'every site replacing account.credential must bump _credGen right after it — '
+    'every site replacing account.credential must bump _credGen before the next one — '
     + `unpaired at line(s) ${unpaired.map(i => i + 1).join(', ') || 'none'}`);
 });
