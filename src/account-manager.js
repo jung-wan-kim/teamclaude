@@ -1049,6 +1049,16 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        // Requests already in flight went out with the token we just replaced.
+        // A refresh is NOT a re-login — entitlement is a property of the account,
+        // so the strike run deliberately survives it (unlike updateAccountTokens,
+        // which wipes it). But a park is one-way and operator-visible, and a 403
+        // can be token-scoped (a token minted before an org policy change), so a
+        // verdict on a superseded token must not be the one that pushes the
+        // account over the park threshold. Bumping the generation makes such a
+        // late response mutate nothing; a genuine entitlement loss simply parks a
+        // round or two later, on evidence from the token the account now holds.
+        account._credGen = (account._credGen || 0) + 1;
         // A successful refresh heals ONLY a refresh-caused 'error' (a refresh
         // that failed while e.g. the network was down): the refresh succeeding
         // is exactly the thing that failed, so the account rejoins rotation

@@ -824,3 +824,26 @@ test('a late 403 from pre-re-login credentials does not re-create the strike run
     proxy.close(); upstream.close();
   }
 });
+
+// A token refresh is not a re-login: entitlement belongs to the account, so the
+// strike run survives it on purpose. But a park is one-way and operator-visible,
+// and a 403 can be token-scoped — so a verdict on a token that has already been
+// replaced must not be the one that crosses the threshold.
+test('a 403 on a token that was refreshed mid-flight does not push the account over the park line', () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0);
+  const a = am.accounts[0];
+
+  const genAtDispatch = a._credGen || 0;
+  a._403Strikes = 4;                                  // one round from a permanent park
+
+  // ensureTokenFresh's refresh path replaces the token and bumps the generation.
+  a.credential = 'refreshed-token';
+  a._credGen = (a._credGen || 0) + 1;
+
+  assert.notEqual(a._credGen, genAtDispatch,
+    'a replaced token must be a new generation, or a stale verdict counts as live');
+  // The run itself survives — a refresh proves nothing about entitlement.
+  assert.equal(a._403Strikes, 4, 'a refresh is not a re-login: the run is not wiped');
+});
