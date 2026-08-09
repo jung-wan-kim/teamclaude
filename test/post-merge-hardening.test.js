@@ -886,3 +886,31 @@ test('every credential replacement bumps the generation', async () => {
   assert.ok(sites >= 3,
     `expected the re-login, TUI re-import and config-sync sites, found ${sites}`);
 });
+
+// The shared method owes the WHOLE bookkeeping. When the cooldown lift was left
+// inline in updateAccountTokens, the two other call sites cleared the strike run
+// but left a freshly re-authenticated account throttled for up to five minutes.
+test('replacing credentials lifts a 403 cooldown but never a quota throttle', () => {
+  const mk = () => new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 0);
+
+  const fromRefusal = mk();
+  const a = fromRefusal.accounts[0];
+  fromRefusal.markRateLimited(a, 300);
+  a._403CooldownUntil = a.rateLimitedUntil;          // this cooldown came from a 403
+  a._403Strikes = 3;
+  fromRefusal.noteCredentialsReplaced(a);
+  assert.equal(a.status, 'active', 'fresh credentials must return the account to rotation');
+  assert.equal(a.rateLimitedUntil, null, 'the 403-derived cooldown lifts with them');
+  assert.equal(a._403Strikes, undefined, 'and the run it belonged to');
+
+  const fromQuota = mk();
+  const b = fromQuota.accounts[0];
+  fromQuota.markRateLimited(b, 300);                 // no _403CooldownUntil → a quota throttle
+  const until = b.rateLimitedUntil;
+  fromQuota.noteCredentialsReplaced(b);
+  assert.equal(b.status, 'throttled',
+    'a quota throttle describes upstream, not the credentials — new keys do not lift it');
+  assert.equal(b.rateLimitedUntil, until, 'routing before retry-after would invite a 429 storm');
+});
