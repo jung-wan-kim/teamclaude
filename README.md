@@ -166,6 +166,23 @@ eval $(teamclaude env)
 claude
 ```
 
+### Claude Code status line
+
+[teamclaude-statusline](https://github.com/cineraria01/teamclaude-statusline) renders a live TUI-style dashboard in the Claude Code status line: per-account quota gauges (5h session / weekly / model windows), plan tier, and the estimated next-billing D-day, plus a pooled FLEET summary row:
+
+```
+Fable 5
+     FLEET         x4      pooled  Ses [   7% 6m    ] Wk [ 11% 6h10m  ] Fbl [ 37% 6h10m  ]
+  1. alice@exampl  Max 20x active  Ses [  0% 1h30m  ] Wk [ 14% 1d14h  ] Fbl [ 27% 1d14h  ]   D-8
+> 2. bob@example.  Max 20x active  Ses [  27% 5m    ] Wk [  8% 6h10m  ] Fbl [ 15% 6h10m  ]  D-25
+```
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/cineraria01/teamclaude-statusline/main/install.sh?$(date +%s)" | bash
+```
+
+It works with this fork out of the box (it reads the running proxy's `/teamclaude/status` endpoint) and also installs a numbered launcher — `claude 1`, `claude 2` — to pin a Claude Code session to a specific account.
+
 ### Other commands
 
 ```bash
