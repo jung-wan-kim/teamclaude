@@ -3,6 +3,13 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 
+// irreversible-mutation-ok: this is a transparent proxy for LLM inference, not an
+// order/payment/transfer domain. Its only "retries" are account FAILOVER on a
+// 429/5xx/403 — responses where the request was REFUSED and never served, so
+// re-dispatching to another account is not a duplicate-delivery risk. A transient
+// mid-flight network error is deliberately NOT retried internally (res.destroy()
+// hands retry to the client), which is exactly the uncertain-outcome discipline.
+
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
@@ -732,15 +739,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     ctx.status = 429;
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold);
+    // acquireAccount() returns null for two very different reasons, and reporting
+    // both as "exhausted" sends the operator chasing a quota problem that doesn't
+    // exist. Distinguish them from the CURRENT fleet state: anyUsable/anyCapped is
+    // true iff some quota-healthy account exists (a free slot right now, or merely
+    // slot-capped) — i.e. the fleet has quota and the blocker is CONCURRENCY
+    // (every healthy account busy + the overflow queue full/timed-out), not the
+    // quota exhaustion the word implies. Both false → no healthy account at all →
+    // genuine over-quota / throttled. Best-effort: the fleet can shift between the
+    // acquire give-up and here, but a misread only changes the wording, never
+    // routing or the retry-after.
+    const saturated = accountManager.anyUsable() || accountManager.anyCapped();
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
+      'x-teamclaude-429-reason': saturated ? 'concurrency_saturated' : 'quota_exhausted',
     });
     res.end(JSON.stringify({
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: saturated
+          ? `All ${accts.length} accounts are at their concurrency slot limit — quota is available, but every account is busy and no slot freed in time. Raise maxConcurrentPerAccount or overflowQueueTimeoutMs, or lower concurrent load. Retry in ${retryAfter}s.`
+          : `All ${accts.length} accounts exhausted (over quota / rate-limited). Retry in ${retryAfter}s.`,
       },
     }));
     return;

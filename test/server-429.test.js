@@ -406,3 +406,70 @@ test('mixed exhausted + healthy-capped fleet → retry-after stays short, not th
     proxy.close();
   }
 });
+
+// The all-blocked 429 must tell the client WHICH of the two blockers it hit.
+// A quota-healthy fleet that is merely concurrency-saturated (every slot at cap,
+// the overflow queue timed out) must NOT be reported as "exhausted" — that sends
+// the operator chasing a quota problem that doesn't exist when the real lever is
+// maxConcurrentPerAccount / overflowQueueTimeoutMs.
+test('concurrency-saturated fleet → 429 reason=concurrency_saturated, body never says "exhausted"', async () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98, 5 * 60 * 1000, 1); // maxConcurrentPerAccount = 1
+  am.accounts[0].quota.unified5h = 0.10;               // quota well under threshold — healthy
+  am.accounts[0].quota.unified5hReset = Date.now() + 3600_000;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: 'http://127.0.0.1:0',
+    activeWarmup: false,
+    overflowQueueTimeoutMs: 50, // queue times the capped request out fast
+  });
+  const proxyPort = await listen(proxy);
+  am.accounts[0].inflight = 1; // its only slot is held by an in-flight request
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-teamclaude-429-reason'), 'concurrency_saturated');
+    assert.ok(!/exhausted/i.test(body.error.message),
+      `saturated fleet must not report "exhausted": ${body.error.message}`);
+    assert.match(body.error.message, /concurrency|maxConcurrentPerAccount/);
+  } finally {
+    proxy.close();
+  }
+});
+
+// The inverse: a genuinely over-quota fleet (no healthy account at all) keeps the
+// truthful "exhausted" wording and reason=quota_exhausted.
+test('genuinely exhausted fleet → 429 reason=quota_exhausted, body says "exhausted"', async () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const resetMs = Date.now() + 3600_000;
+  for (const acct of am.accounts) {            // both over the 5h threshold → no healthy account
+    acct.quota.unified5h = 0.995;
+    acct.quota.unified5hReset = resetMs;
+  }
+  const proxy = startProxy(am, 0);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-teamclaude-429-reason'), 'quota_exhausted');
+    assert.match(body.error.message, /exhausted/);
+  } finally {
+    proxy.close();
+  }
+});
