@@ -397,7 +397,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // could flood, including via /v1/oauth/token). Bound: totalCapacity × maxBodyBytes.
       if (inFlightProxied >= accountManager.totalCapacity()) {
         req.resume(); // drain & discard the body so the socket isn't leaked
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        // The proxy's own admission cap — a concurrency/capacity limit, not quota.
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5', 'x-teamclaude-429-reason': 'concurrency_saturated' });
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
@@ -741,15 +742,18 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold);
     // acquireAccount() returns null for two very different reasons, and reporting
     // both as "exhausted" sends the operator chasing a quota problem that doesn't
-    // exist. Distinguish them from the CURRENT fleet state: anyUsable/anyCapped is
-    // true iff some quota-healthy account exists (a free slot right now, or merely
-    // slot-capped) — i.e. the fleet has quota and the blocker is CONCURRENCY
+    // exist. Distinguish them over the SAME candidate set the acquire just used
+    // (excludeForSelect — null on a first attempt, the tried429∪tried5xx set on a
+    // failover give-up), so the diagnosis matches what this request could actually
+    // route to: anyUsable/anyCapped is true iff a quota-healthy candidate exists (a
+    // free slot right now, or merely slot-capped) — the blocker is CONCURRENCY
     // (every healthy account busy + the overflow queue full/timed-out), not the
-    // quota exhaustion the word implies. Both false → no healthy account at all →
+    // quota exhaustion the word implies. Both false → no healthy candidate at all →
     // genuine over-quota / throttled. Best-effort: the fleet can shift between the
-    // acquire give-up and here, but a misread only changes the wording, never
-    // routing or the retry-after.
-    const saturated = accountManager.anyUsable() || accountManager.anyCapped();
+    // acquire give-up and here, and the predicates only advance lazy fleet state
+    // idempotently — a misread changes the wording, never THIS request's routing or
+    // the retry-after (already computed above).
+    const saturated = accountManager.anyUsable(excludeForSelect) || accountManager.anyCapped(excludeForSelect);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -1151,7 +1155,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           ctx.status = 429;
           const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold);
           if (!res.headersSent) {
-            res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
+            res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra), 'x-teamclaude-429-reason': 'quota_exhausted' });
             res.end(JSON.stringify({
               type: 'error',
               error: { type: 'rate_limit_error', message: `All accounts throttled. Retry in ${ra}s.` },
@@ -1192,7 +1196,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       if (res.destroyed) return;
       if (!res.headersSent) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter), 'x-teamclaude-429-reason': 'upstream_rate_limited' });
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },

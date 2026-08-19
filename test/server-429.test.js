@@ -92,6 +92,7 @@ test('all accounts exhausted → bounded retries, returns 429', async () => {
     });
     await res.text();
     assert.equal(res.status, 429);                                  // returns 429, not hanging
+    assert.equal(res.headers.get('x-teamclaude-429-reason'), 'quota_exhausted'); // both throttled → quota, not concurrency
     assert.ok(upstreamHits >= 1 && upstreamHits <= 4,               // each account tried at most once
       `expected bounded retries, got ${upstreamHits}`);
     assert.ok(am.accounts.every(a => a.status === 'throttled'));    // both throttled until reset
@@ -173,6 +174,7 @@ test('request-global 429 tries each account once then passes through, no poisoni
     });
     await res.text();
     assert.equal(res.status, 429);                                  // passed through after trying all
+    assert.equal(res.headers.get('x-teamclaude-429-reason'), 'upstream_rate_limited'); // global upstream limit, not fleet quota/slots
     assert.equal(upstreamHits, 3, `expected one try per account, got ${upstreamHits}`);
     assert.ok(am.accounts.every(a => a.status === 'active'),        // no account poisoned/throttled
       `expected all accounts active, got ${am.accounts.map(a => a.status).join(',')}`);
@@ -438,7 +440,10 @@ test('concurrency-saturated fleet → 429 reason=concurrency_saturated, body nev
     assert.equal(res.headers.get('x-teamclaude-429-reason'), 'concurrency_saturated');
     assert.ok(!/exhausted/i.test(body.error.message),
       `saturated fleet must not report "exhausted": ${body.error.message}`);
-    assert.match(body.error.message, /concurrency|maxConcurrentPerAccount/);
+    // Pin BOTH actionable knobs — an alternation (/concurrency|maxConcurrentPerAccount/)
+    // would pass a regression that dropped the names but kept the word "concurrency".
+    assert.match(body.error.message, /maxConcurrentPerAccount/);
+    assert.match(body.error.message, /overflowQueueTimeoutMs/);
   } finally {
     proxy.close();
   }
@@ -469,6 +474,9 @@ test('genuinely exhausted fleet → 429 reason=quota_exhausted, body says "exhau
     assert.equal(res.status, 429);
     assert.equal(res.headers.get('x-teamclaude-429-reason'), 'quota_exhausted');
     assert.match(body.error.message, /exhausted/);
+    // Non-inversion: the exhausted branch must not borrow the concurrency wording.
+    assert.ok(!/concurrency|maxConcurrentPerAccount/i.test(body.error.message),
+      `exhausted fleet must not use concurrency wording: ${body.error.message}`);
   } finally {
     proxy.close();
   }
