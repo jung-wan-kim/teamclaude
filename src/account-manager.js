@@ -921,8 +921,22 @@ export class AccountManager {
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
 
+    // `unified-status` is upstream's verdict on THIS response. A family-cap 429
+    // (the Fable `7d_oi` bucket spent) carries `rejected` too, while the shared
+    // `5h` and `7d` statuses on the same response still say `allowed`. Storing
+    // the verdict as-is parks the WHOLE account via isExhausted(), so haiku and
+    // Sonnet requests fail over as well even though the shared weekly is only
+    // half spent. When the response says which shared buckets allowed, believe
+    // them: a rejection none of them signed is the family's, and the family
+    // bucket (modelWeekly / `7d_oi`) is its own signal.
+    // Backported from KarpelesLab/teamclaude (upstream of this fork).
     const uStatus = headers['anthropic-ratelimit-unified-status'];
-    if (uStatus) account.quota.unifiedStatus = uStatus;
+    if (uStatus) {
+      const s5h = headers['anthropic-ratelimit-unified-5h-status'];
+      const s7d = headers['anthropic-ratelimit-unified-7d-status'];
+      const sharedSaidAllowed = (s5h || s7d) && s5h !== 'rejected' && s7d !== 'rejected';
+      account.quota.unifiedStatus = uStatus === 'rejected' && sharedSaidAllowed ? 'allowed' : uStatus;
+    }
 
     // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
     // for the top model tier ("Fable" in Claude's usage UI). These headers only

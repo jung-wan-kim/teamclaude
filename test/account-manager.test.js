@@ -432,3 +432,52 @@ test('getStatus exposes modelWeekly as a detached copy', () => {
   assert.equal(am.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94,
     'mutating the snapshot must not reach live account state');
 });
+
+// ── Fable family-cap regression (backported from KarpelesLab upstream) ──
+// A Fable `7d_oi` cap returns unified-status: rejected while the shared 5h/7d
+// buckets on the SAME response still say allowed. Storing the verdict as-is
+// parked the whole account, so Sonnet/haiku requests failed over too — the
+// real-world "All 8 accounts exhausted" with shared weekly only ~52% spent.
+test('Fable family cap does not park the account for other models', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  const resetSec = Math.floor((now + 2 * 24 * HOUR) / 1000);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-utilization': '0.00',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + HOUR) / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': '0.52',
+    'anthropic-ratelimit-unified-7d-reset': String(resetSec),
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1.00',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(resetSec),
+  });
+  assert.equal(am.accounts[0].quota.unifiedStatus, 'allowed',
+    'a rejection no shared bucket signed belongs to the family, not the account');
+  assert.equal(am.isExhausted(0), false,
+    'account must stay usable for non-Fable models');
+});
+
+test('a genuine shared-bucket rejection still parks the account', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-utilization': '1.00',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + HOUR) / 1000)),
+  });
+  assert.equal(am.accounts[0].quota.unifiedStatus, 'rejected',
+    'the 5h bucket signed this rejection — it is the account\'s');
+  assert.equal(am.isExhausted(0), true);
+});
+
+test('a rejection with no per-bucket statuses is still believed', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-status': 'rejected' });
+  assert.equal(am.accounts[0].quota.unifiedStatus, 'rejected',
+    'absent shared statuses prove nothing — do not downgrade the verdict');
+  assert.equal(am.isExhausted(0), true);
+});
